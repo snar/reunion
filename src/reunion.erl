@@ -20,6 +20,7 @@ start_link() ->
 	gen_server:start_link({local, ?MODULE}, ?MODULE, [[]], []).
 
 init(_Args) -> 
+	mnesia:subscribe(system),
 	Db = ets:new(?TABLE, [bag, named_table]),
 	Tables = lists:foldl(fun
 		(T, Acc) -> 
@@ -28,6 +29,7 @@ init(_Args) ->
 					mnesia:subscribe({table, T, detailed}),
 					sets:add_element(T, Acc);
 				false -> 
+					error_logger:info_msg("~p (init): NOT tracking table ~p~n", [?MODULE, T]),
 					Acc
 			end
 		end, sets:new(), mnesia:system_info(tables)),
@@ -35,8 +37,8 @@ init(_Args) ->
 		[] -> queue;
 		_  -> store
 	end,
+	error_logger:info_msg("~p (init): starting in ~p mode, tracking ~p~n", [?MODULE, Mode, sets:to_list(Tables)]),
 	{ok, #state{db=Db, mode=Mode, queue=queue:new(), tables=Tables}}.
-
 
 handle_call(_Any, _From, State) -> 
 	{reply, {error, badcall}, State, ?DEQUEUE_TIMEOUT}.
@@ -62,7 +64,7 @@ handle_info({mnesia_table_event, {write, Table, Record, [], _ActId}}, State) whe
 handle_info({mnesia_table_event, {write, _Table, _Record, _NonEmptyList, _Act}}, State) -> 
 	% this is update of already existing key, may ignore
 	{noreply, State, ?DEQUEUE_TIMEOUT};
-handle_info({mnesia_table_event, {delete, {Table, Key}, _ActId}}, State) -> 
+handle_info({mnesia_table_event, {delete, Table, {Table, Key}, _Value, _ActId}}, State) -> 
 	Nq = case sets:is_element(Table, State#state.tables) of 
 		true -> unqueue(State#state.queue, Table, Key);
 		false -> State#state.queue
@@ -108,19 +110,9 @@ code_change(_Old, State, _Extra) ->
 
 is_table_tracked(schema) -> false;
 is_table_tracked(T) -> 
-	try mnesia:read_table_property(T, local_content) of 
-		{local_content, true} -> false;
-		{local_content, false} -> 
-			is_table_set(T)
-	catch 
-		exit:_ -> 
-			is_table_set(T)
-	end.
-
-is_table_set(T) -> 
-	case mnesia:table_info(T, type) of 
-		set -> true;
-		_   -> false
+	case {mnesia:table_info(T, local_content), mnesia:table_info(T, type)} of 
+		{false, set} -> true;
+		{_, _} -> false
 	end.
 
 expires() -> 
