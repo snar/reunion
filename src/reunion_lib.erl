@@ -1,5 +1,13 @@
 -module(reunion_lib).
--export([last_version/3, last_modified/3]).
+-export([merge_only/3, last_version/3, last_modified/3]).
+
+merge_only(init, [Tab, Attrs], Remote) -> 
+	{ok, {Tab}};
+merge_only(done, _S, _Remote) -> 
+	stop;
+merge_only(Objs, {Tab} = S, Remote) -> 
+	compare(Objs, Tab, 1, fun(A, B) -> neither end, S, Remote).
+	
 
 last_modified(init, S0, Remote) -> 
 	last_version(init, S0 ++ [modified], Remote);
