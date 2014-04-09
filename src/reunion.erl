@@ -20,7 +20,7 @@ start_link() ->
 	gen_server:start_link({local, ?MODULE}, ?MODULE, [[]], []).
 
 init(_Args) -> 
-	Db = ets:new(?TABLE, [bag]),
+	Db = ets:new(?TABLE, [bag, named_table]),
 	Tables = lists:foldl(fun
 		(T, Acc) -> 
 			case is_table_tracked(T) of 
