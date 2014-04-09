@@ -1,0 +1,318 @@
+-module(reunion).
+-behaviour(gen_server).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
+	code_change/3]).
+-export([start_link/0]).
+-export([handle_remote/2]).
+
+-define(TABLE, ?MODULE).
+-define(DEQUEUE_TIMEOUT, 1000).
+-define(EXPIRE_TIMEOUT, 60). % seconds
+-define(LOCK, {?MODULE, lock}).
+-define(DEFAULT_METHOD, none).
+-define(DONE, {?MODULE, merge_done}).
+
+-record(qentry, {table, key, expires}).
+-record(state, {db, queue, mode, tables = sets:new()}).
+-record(s0, {table, attributes, module, function, xargs, remote, modstate}).
+
+start_link() -> 
+	gen_server:start_link({local, ?MODULE}, ?MODULE, [[]], []).
+
+init(_Args) -> 
+	Db = ets:new(?TABLE, [bag]),
+	Tables = lists:foldl(fun
+		(T, Acc) -> 
+			case is_table_tracked(T) of 
+				true -> 
+					mnesia:subscribe({table, T, detailed}),
+					sets:add_element(T, Acc);
+				false -> 
+					Acc
+			end
+		end, sets:new(), mnesia:system_info(tables)),
+	Mode = case mnesia:system_info(db_nodes) -- mnesia:system_info(running_db_nodes) of 
+		[] -> queue;
+		_  -> store
+	end,
+	{ok, #state{db=Db, mode=Mode, queue=queue:new(), tables=Tables}}.
+
+
+handle_call(_Any, _From, State) -> 
+	{reply, {error, badcall}, State, ?DEQUEUE_TIMEOUT}.
+
+handle_cast(_Any, State) -> 
+	{noreply, State, ?DEQUEUE_TIMEOUT}.
+
+handle_info({mnesia_table_event, {write, Table, Record, [], _ActId}}, State) when State#state.mode == queue -> 
+	Nq = case sets:is_element(Table, State#state.tables) of 
+		false -> State#state.queue;
+		true  -> 
+			queue:in(#qentry{table=Table, key=element(2, Record), expires=expires()}, State#state.queue)
+	end,
+	{noreply, State#state{queue=Nq}, ?DEQUEUE_TIMEOUT};
+handle_info({mnesia_table_event, {write, Table, Record, [], _ActId}}, State) when State#state.mode == store -> 
+	Nq = case sets:is_element(Table, State#state.tables) of 
+		false -> State#state.queue;
+		true  -> 
+			queue:in(#qentry{table=Table, key=element(2, Record), expires=expires()}, State#state.queue)
+	end,
+	ets:insert(?TABLE, {Table, element(2, Record)}),
+	{noreply, State#state{queue=Nq}, ?DEQUEUE_TIMEOUT};
+handle_info({mnesia_table_event, {write, _Table, _Record, _NonEmptyList, _Act}}, State) -> 
+	% this is update of already existing key, may ignore
+	{noreply, State, ?DEQUEUE_TIMEOUT};
+handle_info({mnesia_table_event, {delete, {Table, Key}, _ActId}}, State) -> 
+	Nq = case sets:is_element(Table, State#state.tables) of 
+		true -> unqueue(State#state.queue, Table, Key);
+		false -> State#state.queue
+	end,
+	ets:delete_object(?TABLE, {Table, Key}),
+	{noreply, State#state{queue=Nq}, ?DEQUEUE_TIMEOUT};
+handle_info({mnesia_system_event, {mnesia_up, _Node}}, State) when State#state.mode == store -> 
+	Mode = case nextmode() of 
+		store -> store;
+		queue -> 
+			ets:delete_all_objects(?TABLE),
+			queue
+	end,
+	{noreply, State#state{mode=Mode}, ?DEQUEUE_TIMEOUT};
+handle_info({mnesia_system_event, {mnesia_down, Node}}, State) when State#state.mode == queue -> 
+	% mirror all queued entries to ets
+	queue_mirror(State#state.queue),
+	{noreply, State#state{mode=store}, ?DEQUEUE_TIMEOUT};
+handle_info({mnesia_system_event, {inconsistent_database, Context, Node}}, State) -> 
+	error_logger:info_msg("~p: Inconsistency detected. Context = ~p, Node ~p~n",
+		[?MODULE, Context, Node]),
+	Res = global:trans({?LOCK, self()}, 
+		fun() -> 
+			error_logger:info_msg("~p: have global lock~n", [?MODULE]),
+			stitch_together(Node)
+		end),
+	error_logger:info_msg("~p: stitching with ~p: ~p", [?MODULE, Node, Res]),
+	{noreply, State};
+handle_info(timeout, State) -> 
+	Now = os:timestamp(),
+	Queue = dequeue(State#state.queue, Now),
+	{noreply, State#state{queue=Queue}, ?DEQUEUE_TIMEOUT};
+handle_info(Any, State) -> 
+	error_logger:info_msg("~p: unhandled info ~p~n", [?MODULE, Any]),
+	{noreply, State, ?DEQUEUE_TIMEOUT}.
+
+terminate(Reason, _State) -> 
+	error_logger:info_msg("~p: terminating (~p)", [?MODULE, Reason]),
+	ok.
+
+code_change(_Old, State, _Extra) -> 
+	{ok, State}.
+
+is_table_tracked(schema) -> false;
+is_table_tracked(T) -> 
+	try mnesia:read_table_property(T, local_content) of 
+		{local_content, true} -> false;
+		{local_content, false} -> 
+			is_table_set(T)
+	catch 
+		exit:_ -> 
+			is_table_set(T)
+	end.
+
+is_table_set(T) -> 
+	case mnesia:table_info(T, type) of 
+		set -> true;
+		_   -> false
+	end.
+
+expires() -> 
+	{M, S, Ms} = os:timestamp(), 
+	{M, S+?EXPIRE_TIMEOUT, Ms}.
+
+dequeue(Queue, Now) -> 
+	case queue:out(Queue) of 
+		{empty, Queue} -> Queue;
+		{{value, #qentry{expires=Exp} = Qe}, _Q1} when Exp < Now -> 
+			queue:in_r(Qe, Queue);
+		{{value, #qentry{}}, Q1} -> 
+			dequeue(Q1, Now)
+	end.
+
+unqueue(Queue, Table, Key) -> 
+	queue:filter(fun
+		(#qentry{table=T, key=K}) when T==Table, K==Key -> 
+			false;
+		(#qentry{}) -> 
+			true
+		end, Queue).
+
+nextmode() -> 
+	case mnesia:system_info(db_nodes) -- mnesia:system_info(running_db_nodes) of 
+		[] -> queue;
+		_  -> store
+	end.
+
+queue_mirror(Queue) -> 
+	case queue:out(Queue) of
+		{empty, Queue} -> ok;
+		{{value, #qentry{table=T, key=K}}, Q1} -> 
+			ets:insert(?TABLE, {T, K}),
+			queue_mirror(Q1)
+	end.
+
+stitch_together(Node) -> 
+	case lists:member(Node, mnesia:system_info(running_db_nodes)) of 
+		true -> 
+			error_logger:info_msg("~p: node ~p already running, not stitching~n", [?MODULE, Node]),
+			ok;
+		false -> 
+			pre_stitch_together(Node)
+	end.
+
+pre_stitch_together(Node) -> 
+	case rpc:call(Node, mnesia, system_info, [is_running]) of 
+		yes -> 
+			do_stitch_together(Node);
+		_ -> 
+			error_logger:info_msg("~p: node ~p: mnesia not running (~p), not stitching~n", [?MODULE, Node]),
+			ok
+	end.
+			
+do_stitch_together(Node) -> 
+	IslandB = case rpc:call(Node, mnesia, system_info, [running_db_nodes]) of 
+		{badrpc, Reason} -> 
+			error_logger:info_msg("~p: unable to ask mnesia:system_info(running_db_nodes) on ~p: ~p", [?MODULE, Node, Reason]),
+			error(badrpc);
+		Answer -> 
+			Answer
+	end,
+	TabsAndNodes = affected_tables(IslandB),
+	Tables = [ T || {T, _} <- TabsAndNodes ],
+	DefaultMethod = default_method(),
+	TabMethods = [{T, Ns, get_method(T, DefaultMethod)} || {T, Ns} <- TabsAndNodes],
+	mnesia_controller:connect_nodes([Node], 
+		fun(MergeF) -> 
+			case MergeF(Tables) of 
+				{merged, _, _} = Res -> 
+					stitch_tabs(TabMethods, Node),
+					Res;
+				Other -> 
+					Other
+			end
+		end).
+
+stitch_tabs(TabMethods, Node) -> 
+	[ do_stitch(TM, Node) || TM <- TabMethods ].
+
+do_stitch({Tab, _Nodes, {M, F, Xargs}}, Node) -> 
+	Attrs = mnesia:table_info(Tab, attributes),
+	S0 = #s0{module = M, function=F, xargs=Xargs, table=Tab, 
+		attributes = Attrs, remote = Node},
+	try run_stitch(check_return(M:F(init, [Tab, Attrs|Xargs]), S0)) of 
+		ok -> ok;
+		_  -> error(badreturn)
+	catch 
+		throw:?DONE -> ok
+	end.
+
+check_return(stop, _S0) -> 
+	throw(?DONE);
+check_return({ok, St}, S) -> 
+	S#s0{modstate=St};
+check_return({ok, Actions, St}, S) -> 
+	S1 = S#s0{modstate=St},
+	perform_actions(Actions, S1).
+
+run_stitch(#s0{module=M, function=F, table=Tab, remote=Remote, 
+	modstate=MSt} = S) -> 
+	LocalKeys = mnesia:dirty_all_keys(Tab),
+	Keys = lists:concat(LocalKeys, remote_keys(Remote, Tab)),
+	lists:foldl(fun(K, Sx) -> 
+		A = mnesia:read({Tab, K}),
+		B = remote_object(Remote, Tab, K), 
+		if 
+			A == B -> Sx;
+			true   -> 
+				check_return(M:F([{A, B}], MSt, Remote), Sx)
+		end
+	end, S, Keys),
+	M:F(done, MSt). 
+
+affected_tables(IslandB) -> 
+	IslandA = mnesia:system_info(running_db_nodes),
+	Tables = mnesia:system_info(tables) -- [schema], 
+	lists:foldl(fun(T, Acc) -> 
+		Tracked = is_table_tracked(T),
+		Nodes = lists:concat([mnesia:table_info(T, C) || C <- backend_types()]),
+		case {intersection(IslandA, Nodes), intersection(IslandB, Nodes), Tracked} of 
+			{[_|_], [_|_], true} -> 
+				[{T, Nodes}|Acc];
+			_ -> Acc
+		end end, [], Tables).
+
+perform_actions(Actions, #s0{table=Tab, remote=R} = S0) -> 
+	local_perform_actions(Tab, Actions),
+	ask_remote(R, {actions, Tab, Actions}),
+	S0.
+
+local_perform_actions(Tab, Action) when is_tuple(Action) -> 
+	local_perform_actions(Tab, [Action]);
+local_perform_actions(Tab, Actions) -> 
+	lists:foreach(fun
+		({write, Data}) when is_list(Data) -> 
+			write_result(Tab, Data);
+		({delete, Data}) when is_list(Data) -> 
+			[mnesia:dirty_delete({Tab, D}) || D <- Data]
+		end, Actions).
+
+write_result(Tab, Data) -> 
+	mnesia:dirty_write(Tab, Data).
+
+remote_keys(Remote, Tab) -> 
+	ask_remote(Remote, {get_keys, Tab}).
+
+remote_object(Remote, Tab, Key) -> 
+	ask_remote(Remote, {get_object, Tab, Key}).
+
+ask_remote(Remote, Query) -> 
+	case rpc:call(Remote, ?MODULE, handle_remote, [Query, self()]) of 
+		{badrpc, Reason} -> 
+			error_logger:error_msg("~p: unable to query ~p for handle_remote(~p): ~p", 
+				[?MODULE, Remote, Query, Reason]),
+			error(badrpc);
+		Other -> 
+			Other
+	end.
+
+handle_remote({actions, Tab, Actions}, _) -> 
+	local_perform_actions(Tab, Actions);
+handle_remote({get_keys, Tab}, Pid) ->  % XXXXX - implement Pid tracking
+	ets:lookup(?TABLE, Tab);
+handle_remote({get_object, Tab, Key}, _Pid) -> 
+	mnesia:dirty_read({Tab, Key}).
+
+	
+backend_types() ->
+	try mnesia:system_info(backend_types)
+	catch
+		exit:_ ->
+			[ram_copies, disc_copies, disc_only_copies]
+	end.
+
+default_method() -> 
+	get_env(default_method, ?DEFAULT_METHOD).
+
+get_method(Table, Default) -> 
+	try mnesia:read_table_property(Table, reunion_compare) of 
+		{reunion_compare, Method} -> Method
+	catch 
+		exit:_ -> 
+			Default
+	end.
+
+get_env(Env, Default) -> 
+	case application:get_env(Env) of 
+		undefined -> Default;
+		{ok, undefined} -> Default;
+		{ok, Value} -> Value
+	end.
+
+intersection(A, B) -> A -- (A -- B).

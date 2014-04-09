@@ -1,0 +1,12 @@
+{application, reunion,
+ [
+  {description, "Mnesia Unifier"},
+  {vsn, "1"},
+  {registered, [reunion]},
+  {applications, [
+                  kernel,
+                  stdlib
+                 ]},
+  {mod, { reunion_app, []}},
+  {env, []}
+ ]}.
