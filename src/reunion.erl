@@ -9,7 +9,7 @@
 -define(DEQUEUE_TIMEOUT, 1000).
 -define(EXPIRE_TIMEOUT, 60). % seconds
 -define(LOCK, {?MODULE, lock}).
--define(DEFAULT_METHOD, none).
+-define(DEFAULT_METHOD, {reunion_lib, merge_only}).
 -define(DONE, {?MODULE, merge_done}).
 
 -record(qentry, {table, key, expires}).
