@@ -99,6 +99,9 @@ handle_info(timeout, State) ->
 	{noreply, State#state{queue=Queue}, ?DEQUEUE_TIMEOUT};
 handle_info({mnesia_system_event,{mnesia_info, _, _}}, State) -> 
 	{noreply, State, ?DEQUEUE_TIMEOUT};
+handle_info({mnesia_system_event, {mnesia_down, Node}}, State) 
+	when State#state.mode == store -> 
+	{noreply, State, ?DEQUEUE_TIMEOUT};
 handle_info(Any, State) -> 
 	error_logger:info_msg("~p: unhandled info ~p~n", [?MODULE, Any]),
 	{noreply, State, ?DEQUEUE_TIMEOUT}.
@@ -206,7 +209,7 @@ do_stitch({Tab, _Nodes, {M, F, Xargs}}, Node) ->
 	Attrs = mnesia:table_info(Tab, attributes),
 	S0 = #s0{module = M, function=F, xargs=Xargs, table=Tab, 
 		attributes = Attrs, remote = Node},
-	try run_stitch(check_return(M:F(init, [Tab, Attrs|Xargs]), S0)) of 
+	try run_stitch(check_return(M:F(init, [Tab, Attrs|Xargs], Node), S0)) of 
 		ok -> ok;
 		_  -> error(badreturn)
 	catch 
@@ -224,7 +227,7 @@ check_return({ok, Actions, St}, S) ->
 run_stitch(#s0{module=M, function=F, table=Tab, remote=Remote, 
 	modstate=MSt} = S) -> 
 	LocalKeys = mnesia:dirty_all_keys(Tab),
-	Keys = lists:concat(LocalKeys, remote_keys(Remote, Tab)),
+	Keys = lists:concat([LocalKeys, remote_keys(Remote, Tab)]),
 	lists:foldl(fun(K, Sx) -> 
 		A = mnesia:read({Tab, K}),
 		B = remote_object(Remote, Tab, K), 
