@@ -4,6 +4,7 @@
 	code_change/3]).
 -export([start_link/0]).
 -export([handle_remote/2, is_locally_inserted/2, is_remotely_inserted/3]).
+-export([report_inconsistency/3]).
 
 -define(TABLE, ?MODULE).
 -define(DEQUEUE_TIMEOUT, 1000).
@@ -302,6 +303,9 @@ is_locally_inserted(Tab, Key) ->
 
 is_remotely_inserted(Tab, Key, Node) -> 
 	ask_remote(Node, {is_locally_inserted, Tab, Key}).
+
+report_inconsistency(Tab, A, B) -> 
+	alarm_handler:set_alarm({reunion, inconsistency, [Tab, A, B]}).
 	
 backend_types() ->
 	try mnesia:system_info(backend_types)

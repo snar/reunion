@@ -58,7 +58,8 @@ compare(Objs, T, P, Comp, S, Remote) ->
 			case Comp(ModA, ModB) of 
 				left -> {ok, {write, A}, S};
 				right -> {ok, {write, B}, S};
-				neither -> {error, {uncomparable, A, B}}
+				neither -> reunion:report_inconsistency(T, A, B),
+					{ok, S}
 			end
 	end.
 		
