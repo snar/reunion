@@ -99,6 +99,9 @@ handle_info(timeout, State) ->
 	{noreply, State#state{queue=Queue}, ?DEQUEUE_TIMEOUT};
 handle_info({mnesia_system_event,{mnesia_info, _, _}}, State) -> 
 	{noreply, State, ?DEQUEUE_TIMEOUT};
+handle_info({mnesia_system_event, {mnesia_down, Node}}, State) 
+	when State#state.mode == store -> 
+	{noreply, State, ?DEQUEUE_TIMEOUT};
 handle_info(Any, State) -> 
 	error_logger:info_msg("~p: unhandled info ~p~n", [?MODULE, Any]),
 	{noreply, State, ?DEQUEUE_TIMEOUT}.
