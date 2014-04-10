@@ -264,7 +264,9 @@ local_perform_actions(Tab, Actions) ->
 		({write, Data}) when is_list(Data) -> 
 			write_result(Tab, Data);
 		({delete, Data}) when is_list(Data) -> 
-			[mnesia:dirty_delete({Tab, D}) || D <- Data]
+			[mnesia:dirty_delete({Tab, D}) || D <- Data];
+		({delete, Data}) -> 
+			mnesia:dirty_delete(Data)
 		end, Actions).
 
 write_result(Tab, Data) -> 
