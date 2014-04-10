@@ -92,11 +92,13 @@ handle_info({mnesia_system_event, {inconsistent_database, Context, Node}}, State
 			stitch_together(Node)
 		end),
 	error_logger:info_msg("~p: stitching with ~p: ~p", [?MODULE, Node, Res]),
-	{noreply, State};
+	{noreply, State, ?DEQUEUE_TIMEOUT};
 handle_info(timeout, State) -> 
 	Now = os:timestamp(),
 	Queue = dequeue(State#state.queue, Now),
 	{noreply, State#state{queue=Queue}, ?DEQUEUE_TIMEOUT};
+handle_info({mnesia_system_event,{mnesia_info, _, _}}, State) -> 
+	{noreply, State, ?DEQUEUE_TIMEOUT};
 handle_info(Any, State) -> 
 	error_logger:info_msg("~p: unhandled info ~p~n", [?MODULE, Any]),
 	{noreply, State, ?DEQUEUE_TIMEOUT}.
@@ -163,8 +165,8 @@ pre_stitch_together(Node) ->
 	case rpc:call(Node, mnesia, system_info, [is_running]) of 
 		yes -> 
 			do_stitch_together(Node);
-		_ -> 
-			error_logger:info_msg("~p: node ~p: mnesia not running (~p), not stitching~n", [?MODULE, Node]),
+		Other -> 
+			error_logger:info_msg("~p: node ~p: mnesia not running (~p), not stitching~n", [?MODULE, Node, Other]),
 			ok
 	end.
 			
@@ -180,6 +182,8 @@ do_stitch_together(Node) ->
 	Tables = [ T || {T, _} <- TabsAndNodes ],
 	DefaultMethod = default_method(),
 	TabMethods = [{T, Ns, get_method(T, DefaultMethod)} || {T, Ns} <- TabsAndNodes],
+	case mnesia:system_info(is_running) of 
+		yes -> 
 	mnesia_controller:connect_nodes([Node], 
 		fun(MergeF) -> 
 			case MergeF(Tables) of 
@@ -189,7 +193,11 @@ do_stitch_together(Node) ->
 				Other -> 
 					Other
 			end
-		end).
+		end);
+	Other -> 
+		error_logger:error_msg("~p: NOT connecting to ~p: mnesia not running (~p)", [?MODULE, Node, Other]),
+		ok
+	end.
 
 stitch_tabs(TabMethods, Node) -> 
 	[ do_stitch(TM, Node) || TM <- TabMethods ].
