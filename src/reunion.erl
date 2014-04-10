@@ -3,7 +3,7 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
 	code_change/3]).
 -export([start_link/0]).
--export([handle_remote/2]).
+-export([handle_remote/2, is_locally_inserted/2, is_remotely_inserted/3]).
 
 -define(TABLE, ?MODULE).
 -define(DEQUEUE_TIMEOUT, 1000).
@@ -206,7 +206,7 @@ do_stitch({Tab, _Nodes, {M, F, Xargs}}, Node) ->
 	Attrs = mnesia:table_info(Tab, attributes),
 	S0 = #s0{module = M, function=F, xargs=Xargs, table=Tab, 
 		attributes = Attrs, remote = Node},
-	try run_stitch(check_return(M:F(init, [Tab, Attrs|Xargs]), S0)) of 
+	try run_stitch(check_return(M:F(init, [Tab, Attrs|Xargs], Node), S0)) of 
 		ok -> ok;
 		_  -> error(badreturn)
 	catch 
@@ -224,7 +224,7 @@ check_return({ok, Actions, St}, S) ->
 run_stitch(#s0{module=M, function=F, table=Tab, remote=Remote, 
 	modstate=MSt} = S) -> 
 	LocalKeys = mnesia:dirty_all_keys(Tab),
-	Keys = lists:concat(LocalKeys, remote_keys(Remote, Tab)),
+	Keys = lists:concat([LocalKeys, remote_keys(Remote, Tab)]),
 	lists:foldl(fun(K, Sx) -> 
 		A = mnesia:read({Tab, K}),
 		B = remote_object(Remote, Tab, K), 
@@ -287,8 +287,18 @@ handle_remote({actions, Tab, Actions}, _) ->
 handle_remote({get_keys, Tab}, Pid) ->  % XXXXX - implement Pid tracking
 	ets:lookup(?TABLE, Tab);
 handle_remote({get_object, Tab, Key}, _Pid) -> 
-	mnesia:dirty_read({Tab, Key}).
+	mnesia:dirty_read({Tab, Key});
+handle_remote({is_locally_inserted, Tab, Key}, _Pid) -> 
+	is_locally_inserted(Tab, Key).
 
+is_locally_inserted(Tab, Key) -> 
+	case ets:lookup(?TABLE, Tab) of 
+		[] -> false;
+		List -> lists:keymember(Key, 2, List)
+	end.
+
+is_remotely_inserted(Tab, Key, Node) -> 
+	ask_remote(Node, {is_locally_inserted, Tab, Key}).
 	
 backend_types() ->
 	try mnesia:system_info(backend_types)
