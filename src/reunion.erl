@@ -252,13 +252,13 @@ affected_tables(IslandB) ->
 			_ -> Acc
 		end end, [], Tables).
 
+perform_actions(Actions, S0) when is_tuple(Actions) -> 
+	perform_actions([Actions], S0);
 perform_actions(Actions, #s0{table=Tab, remote=R} = S0) -> 
 	local_perform_actions(Tab, Actions),
 	ask_remote(R, {actions, Tab, Actions}),
 	S0.
 
-local_perform_actions(Tab, Action) when is_tuple(Action) -> 
-	local_perform_actions(Tab, [Action]);
 local_perform_actions(Tab, Actions) -> 
 	lists:foreach(fun
 		({write, Data}) when is_list(Data) -> 
