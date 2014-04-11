@@ -72,27 +72,34 @@ handle_info({mnesia_table_event, {delete, Table, {Table, Key}, _Value, _ActId}},
 	end,
 	ets:delete_object(?TABLE, {Table, Key}),
 	{noreply, State#state{queue=Nq}, ?DEQUEUE_TIMEOUT};
-handle_info({mnesia_system_event, {mnesia_up, _Node}}, State) when State#state.mode == store -> 
+handle_info({mnesia_system_event, {mnesia_up, Node}}, State) when State#state.mode == store -> 
 	Mode = case nextmode() of 
 		store -> store;
 		queue -> 
 			ets:delete_all_objects(?TABLE),
 			queue
 	end,
+	error_logger:info_msg("~p: got mnesia_up ~p in store mode, next mode: ~p", [?MODULE, Node, Mode]),
 	{noreply, State#state{mode=Mode}, ?DEQUEUE_TIMEOUT};
 handle_info({mnesia_system_event, {mnesia_down, Node}}, State) when State#state.mode == queue -> 
 	% mirror all queued entries to ets
 	queue_mirror(State#state.queue),
+	error_logger:info_msg("~p: got mnesia_down ~p in queue mode, switching to store", [?MODULE, Node]),
 	{noreply, State#state{mode=store}, ?DEQUEUE_TIMEOUT};
 handle_info({mnesia_system_event, {inconsistent_database, Context, Node}}, State) -> 
 	error_logger:info_msg("~p: Inconsistency detected. Context = ~p, Node ~p~n",
 		[?MODULE, Context, Node]),
 	Res = global:trans({?LOCK, self()}, 
 		fun() -> 
-			error_logger:info_msg("~p: have global lock~n", [?MODULE]),
+			error_logger:info_msg("~p: have global lock. mnesia locks: ~p", 
+				[?MODULE, mnesia_locker:get_held_locks()]),
+			error_logger:info_msg("~p: nodes: ~p, running: ~p, ~p messages: ~p", 
+				[?MODULE, mnesia:system_info(db_nodes), mnesia:system_info(running_db_nodes),
+				process_info(self(), message_queue_len), process_info(self(), messages)]),
 			stitch_together(Node)
 		end),
 	error_logger:info_msg("~p: stitching with ~p: ~p", [?MODULE, Node, Res]),
+	error_logger:info_msg("~p: locks after stitch: ~p", [?MODULE, mnesia_locker:get_held_locks()]),
 	{noreply, State, ?DEQUEUE_TIMEOUT};
 handle_info(timeout, State) -> 
 	Now = os:timestamp(),
@@ -186,22 +193,19 @@ do_stitch_together(Node) ->
 	Tables = [ T || {T, _} <- TabsAndNodes ],
 	DefaultMethod = default_method(),
 	TabMethods = [{T, Ns, get_method(T, DefaultMethod)} || {T, Ns} <- TabsAndNodes],
-	case mnesia:system_info(is_running) of 
-		yes -> 
+	error_logger:info_msg("~p: calling connect_nodes(~p) with Tables = ~p", [?MODULE, Node, Tables]),
 	mnesia_controller:connect_nodes([Node], 
 		fun(MergeF) -> 
 			case MergeF(Tables) of 
 				{merged, _, _} = Res -> 
+					error_logger:info_msg("~p: MergeF ret = ~p", [?MODULE, Res]),
 					stitch_tabs(TabMethods, Node),
 					Res;
 				Other -> 
+					error_logger:info_msg("~p: MergeF ret = ~p (nonstitch)", [?MODULE, Other]),
 					Other
 			end
-		end);
-	Other -> 
-		error_logger:error_msg("~p: NOT connecting to ~p: mnesia not running (~p)", [?MODULE, Node, Other]),
-		ok
-	end.
+		end).
 
 stitch_tabs(TabMethods, Node) -> 
 	[ do_stitch(TM, Node) || TM <- TabMethods ].
@@ -260,17 +264,18 @@ perform_actions(Actions, #s0{table=Tab, remote=R} = S0) ->
 	S0.
 
 local_perform_actions(Tab, Actions) -> 
+	error_logger:info_msg("~p: handling action ~p on ~p", [?MODULE, Actions, Tab]),
 	lists:foreach(fun
 		({write, Data}) when is_list(Data) -> 
-			write_result(Tab, Data);
+			[mnesia:dirty_write(Tab, D) || D <- Data];
+		({write, Data}) -> 
+			mnesia:dirty_write(Tab, Data);
 		({delete, Data}) when is_list(Data) -> 
 			[mnesia:dirty_delete({Tab, D}) || D <- Data];
 		({delete, Data}) -> 
 			mnesia:dirty_delete(Data)
 		end, Actions).
 
-write_result(Tab, Data) -> 
-	mnesia:dirty_write(Tab, Data).
 
 remote_keys(Remote, Tab) -> 
 	ask_remote(Remote, {get_keys, Tab}).
