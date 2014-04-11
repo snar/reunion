@@ -242,7 +242,8 @@ run_stitch(#s0{module=M, function=F, table=Tab, remote=Remote,
 				check_return(M:F([{A, B}], MSt, Remote), Sx)
 		end
 	end, S, Keys),
-	M:F(done, MSt). 
+	M:F(done, MSt, Remote),
+	ok.
 
 affected_tables(IslandB) -> 
 	IslandA = mnesia:system_info(running_db_nodes),
@@ -271,9 +272,9 @@ local_perform_actions(Tab, Actions) ->
 		({write, Data}) -> 
 			mnesia:dirty_write(Tab, Data);
 		({delete, Data}) when is_list(Data) -> 
-			[mnesia:dirty_delete({Tab, D}) || D <- Data];
+			[mnesia:dirty_delete_object(D) || D <- Data];
 		({delete, Data}) -> 
-			mnesia:dirty_delete(Data)
+			mnesia:dirty_delete_object(Data)
 		end, Actions).
 
 
