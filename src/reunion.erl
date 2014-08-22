@@ -130,7 +130,8 @@ handle_info({mnesia_table_event, {write, Table, Record, [], _ActId}}, State) ->
 		true  -> 
 			case State#state.mode of 
 				store -> 
-					?debug("reunion(store): storing {~p, ~p}", [Table, element(2, Record)]),
+					?debug("reunion(store): storing {~p, ~p}~n", 
+						[Table, element(2, Record)]),
 					ets:insert(?TABLE, {Table, element(2, Record)});
 				queue -> ok
 			end,
@@ -165,7 +166,7 @@ handle_info({mnesia_system_event, {mnesia_up, Node}}, State) when
 	Mode = case nextmode() of 
 		store -> store;
 		queue -> 
-			?debug("reunion(store->queue): removing all keys", []),
+			?debug("reunion(store->queue): removing all keys~n", []),
 			ets:delete_all_objects(?TABLE),
 			queue
 	end,
@@ -266,7 +267,7 @@ queue_mirror(Queue) ->
 	case queue:out(Queue) of
 		{empty, Queue} -> ok;
 		{{value, #qentry{table=T, key=K}}, Q1} -> 
-			?debug("reunion(queue_mirror): storing {~p, ~p}", [T, K]),
+			?debug("reunion(queue_mirror): storing {~p, ~p}~n", [T, K]),
 			ets:insert(?TABLE, {T, K}),
 			queue_mirror(Q1)
 	end.
@@ -357,11 +358,11 @@ run_stitch(#s0{module=M, function=F, table=Tab, remote=Remote, type=Type,
 				% remote element is not present
 				case is_locally_inserted(Tab, K) of 
 					true -> 
-						?debug("reunion(stitch ~p ~p ~p ~p): write remote", 
+						?debug("reunion(stitch ~p ~p ~p ~p): write remote~n", 
 							[Tab, Type, A, B]),
 						write(Remote, Aa);
 					false -> 
-						?debug("reunion(stitch ~p ~p ~p ~p): delete local", 
+						?debug("reunion(stitch ~p ~p ~p ~p): delete local~n", 
 							[Tab, Type, A, B]),
 						delete(Aa)
 				end,
@@ -370,11 +371,11 @@ run_stitch(#s0{module=M, function=F, table=Tab, remote=Remote, type=Type,
 				% local element not present
 				case is_remotely_inserted(Tab, K, Remote) of 
 					true -> 
-						?debug("reunion(stitch ~p ~p ~p ~p): write local", 
+						?debug("reunion(stitch ~p ~p ~p ~p): write local~n", 
 							[Tab, Type, A, B]),
 						write(Bb);
 					false -> 
-						?debug("reunion(stitch ~p ~p ~p ~p): delete remote", 
+						?debug("reunion(stitch ~p ~p ~p ~p): delete remote~n", 
 							[Tab, Type, A, B]),
 						delete(Remote, Bb)
 				end,
@@ -382,28 +383,28 @@ run_stitch(#s0{module=M, function=F, table=Tab, remote=Remote, type=Type,
 			{[Aa], [Bb]} when Type == set -> 
 				Sn = case M:F(Aa, Bb, Sx) of 
 					{ok, left, Sr} -> 
-						?debug("reunion(stitch ~p ~p ~p ~p): left, write remote", 
+						?debug("reunion(stitch ~p ~p ~p ~p): left, write remote~n", 
 							[Tab, Type, A, B]),
 						write(Remote, Aa), 
 						Sr;
 					{ok, right, Sr} -> 
-						?debug("reunion(stitch ~p ~p ~p ~p): right, write local", 
+						?debug("reunion(stitch ~p ~p ~p ~p): right, write local~n", 
 							[Tab, Type, A, B]),
 						write(Bb), Sr;
 					{ok, both, Sr} when Type == bag -> 
-						?debug("reunion(stitch ~p ~p ~p ~p): both, write both", 
+						?debug("reunion(stitch ~p ~p ~p ~p): both, write both~n", 
 							[Tab, Type, A, B]),
 						write(Bb),
 						write(Remote, Aa), 
 						Sr;
 					{ok, neither, Sr} -> 
-						?debug("reunion(stitch ~p ~p ~p ~p): neither, delete both", 
+						?debug("reunion(stitch ~p ~p ~p ~p): neither, delete both~n", 
 							[Tab, Type, A, B]),
 						delete(Aa),
 						delete(Remote, Bb), 
 						Sr;
 					{inconsistency, Error, Sr} -> 
-						?debug("reunion(stitch ~p ~p ~p ~p): inconsistency ~p", 
+						?debug("reunion(stitch ~p ~p ~p ~p): inconsistency ~p~n", 
 							[Tab, Type, A, B, Error]),
 						report_inconsistency(Tab, Aa, Bb, Error),
 						Sr
@@ -473,8 +474,13 @@ handle_remote({is_locally_inserted, Tab, Key}, _Pid) ->
 
 is_locally_inserted(Tab, Key) -> 
 	case ets:lookup(?TABLE, Tab) of 
-		[] -> false;
-		List -> lists:keymember(Key, 2, List)
+		[] -> 
+			?debug("reunion(is_locally_inserted): {~p, ~p} is not~n", [Tab, Key]),
+			false;
+		List -> 
+			?debug("reunion(is_locally_inserted): {~p, ~p} in ~p: ~p~n", 
+				[Tab, Key, List, lists:keymember(Key, 2, List)]),
+			lists:keymember(Key, 2, List)
 	end.
 
 is_remotely_inserted(Tab, Key, Node) -> 
