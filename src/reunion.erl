@@ -135,6 +135,8 @@ handle_info({mnesia_table_event, {write, Table, Record, [], _ActId}}, State) ->
 					ets:insert(?TABLE, {Table, element(2, Record)});
 				queue -> ok
 			end,
+			?debug("reunion(~p): queueing {~p, ~p}~n", 
+					[State#state.mode, Table, element(2, Record)]),
 			queue:in(#qentry{table=Table, key=element(2, Record), expires=expires()}, 
 				State#state.queue)
 	end,
@@ -238,14 +240,17 @@ dequeue(Queue, Now) ->
 	case queue:out(Queue) of 
 		{empty, Queue} -> Queue;
 		{{value, #qentry{expires=Exp} = Qe}, _Q1} when Exp < Now -> 
-			queue:in_r(Qe, Queue);
-		{{value, #qentry{}}, Q1} -> 
+			?debug("reunion(dequeue): not expiring ~p~n", [Qe]),
+			Queue;
+		{{value, #qentry{} = _Qe}, Q1} -> 
+			?debug("reunion(dequeue): expired ~p~n", [_Qe]),
 			dequeue(Q1, Now)
 	end.
 
 unqueue(Queue, Table, Key) -> 
 	queue:filter(fun
-		(#qentry{table=T, key=K}) when T==Table, K==Key -> 
+		(#qentry{table=T, key=K} = _Qe) when T==Table, K==Key -> 
+			?debug("reunion(unqueue/3): deleted ~p~n", [_Qe]),
 			false;
 		(#qentry{}) -> 
 			true
@@ -253,7 +258,9 @@ unqueue(Queue, Table, Key) ->
 
 unqueue(Queue, Table) -> 
 	queue:filter(fun
-		(#qentry{table=T}) when T == Table -> false;
+		(#qentry{table=T} = _Qe) when T == Table -> 
+			?debug("reunion(unqueue/2): deleted ~p~n", [_Qe]),
+			false;
 		(#qentry{}) -> true
 		end, Queue).
 
