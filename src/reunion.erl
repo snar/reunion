@@ -4,7 +4,7 @@
 	code_change/3]).
 -export([start_link/0]).
 -export([handle_remote/2, is_locally_inserted/2, is_remotely_inserted/3]).
--export([report_inconsistency/4]).
+-export([report_inconsistency/4, try_recover/1, try_recover/0]).
 
 -define(TABLE, ?MODULE).
 -define(DEQUEUE_TIMEOUT, 1000).
@@ -21,6 +21,26 @@
 start_link() -> 
 	gen_server:start_link({local, ?MODULE}, ?MODULE, [[]], []).
 
+try_recover(Node) -> 
+	case lists:member(Node, nodes()) of 
+		true -> 
+			error_logger:info_msg("~p: simulating inconsistent database "
+				"event: node ~p is running", [Node]),
+			whereis(?MODULE) ! {mnesia_system_event, {inconsistent_database,
+				local, Node}};
+		false -> 
+			error_logger:info_msg("ignoring node ~p: not connected", [Node])
+	end.
+
+
+try_recover() -> 
+	case mnesia:system_info(db_nodes) -- mnesia:system_info(running_db_nodes) of
+		[] -> 
+			ok;
+		Nodes -> 
+			lists:foreach(fun(F) -> try_recover(F) end, Nodes)
+	end.
+
 init(_Args) -> 
 	Node = node(),
 	{ok, Node} = mnesia:subscribe(system),
@@ -29,7 +49,7 @@ init(_Args) ->
 	Tables = lists:foldl(fun
 		(schema, Acc) -> Acc;
 		(T, Acc) -> 
-			Attrs = mnesia:system_info(T, all),
+			Attrs = mnesia:table_info(T, all),
 			case should_track(Attrs) of 
 				true -> 
 					mnesia:subscribe({table, T, detailed}),
@@ -53,6 +73,9 @@ handle_call(_Any, _From, State) ->
 handle_cast(_Any, State) -> 
 	{noreply, State, ?DEQUEUE_TIMEOUT}.
 
+handle_info({mnesia_table_event, {write, schema, {schema, schema, _Attrs}, _, 
+	_ActId}}, State) ->
+	{noreply, State, ?DEQUEUE_TIMEOUT};
 handle_info({mnesia_table_event, {write, schema, {schema, Table, Attrs}, _, 
 	_ActId}}, State) ->
 	case {should_track(Attrs), sets:is_element(Table, State#state.tables)} of 
@@ -127,19 +150,23 @@ handle_info({mnesia_table_event, {delete, Table, Record, _Old, _ActId}}, State) 
 	end,
 	ets:delete_object(?TABLE, {Table, Key}),
 	{noreply, State#state{queue=Nq}, ?DEQUEUE_TIMEOUT};
-handle_info({mnesia_system_event, {mnesia_up, Node}}, State) when State#state.mode == store -> 
+handle_info({mnesia_system_event, {mnesia_up, Node}}, State) when 
+	State#state.mode == store -> 
 	Mode = case nextmode() of 
 		store -> store;
 		queue -> 
 			ets:delete_all_objects(?TABLE),
 			queue
 	end,
-	error_logger:info_msg("~p: got mnesia_up ~p in store mode, next mode: ~p", [?MODULE, Node, Mode]),
+	error_logger:info_msg("~p: got mnesia_up ~p in store mode, next mode: ~p", 
+		[?MODULE, Node, Mode]),
 	{noreply, State#state{mode=Mode}, ?DEQUEUE_TIMEOUT};
-handle_info({mnesia_system_event, {mnesia_down, Node}}, State) when State#state.mode == queue -> 
+handle_info({mnesia_system_event, {mnesia_down, Node}}, State) when 
+	State#state.mode == queue -> 
 	% mirror all queued entries to ets
 	queue_mirror(State#state.queue),
-	error_logger:info_msg("~p: got mnesia_down ~p in queue mode, switching to store", [?MODULE, Node]),
+	error_logger:info_msg("~p: got mnesia_down ~p in queue mode, switching to store", 
+		[?MODULE, Node]),
 	{noreply, State#state{mode=store}, ?DEQUEUE_TIMEOUT};
 handle_info({mnesia_system_event, {inconsistent_database, Context, Node}}, State) -> 
 	error_logger:info_msg("~p: Inconsistency detected. Context = ~p, Node ~p~n",
@@ -154,7 +181,6 @@ handle_info({mnesia_system_event, {inconsistent_database, Context, Node}}, State
 			stitch_together(Node)
 		end),
 	error_logger:info_msg("~p: stitching with ~p: ~p", [?MODULE, Node, Res]),
-	error_logger:info_msg("~p: locks after stitch: ~p", [?MODULE, mnesia_locker:get_held_locks()]),
 	{noreply, State, ?DEQUEUE_TIMEOUT};
 handle_info(timeout, State) -> 
 	Now = os:timestamp(),

@@ -2,7 +2,7 @@
 -export([merge_only/3, last_version/3, last_modified/3]).
 
 merge_only(init, {_,set,_,_}, _) -> {ok, set};
-merge_only(stop, _, _) -> ok;
+merge_only(done, _, _) -> ok;
 merge_only(A, B, set) -> 
 	{inconsistency, {merge, A, B}, set}.
 
@@ -13,7 +13,7 @@ last_modified(A, B, C) ->
 
 last_version(init, {Table, set, Attrs, [VField|_]}, _Node) -> 
 	{ok, {set, pos(VField, Table, Attrs)}};
-last_version(stop, _State, _Node) -> 
+last_version(done, _State, _Node) -> 
 	ok;
 last_version(A, B, {set, Field}) when is_tuple(A), is_tuple(B) -> 
 	case element(Field, A) >= element(Field, B) of 
