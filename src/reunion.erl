@@ -12,6 +12,12 @@
 -define(LOCK, {?MODULE, lock}).
 -define(DEFAULT_METHOD, {reunion_lib, merge_only, []}).
 -define(DONE, {?MODULE, merge_done}).
+-define(DEBUG, 1).
+-ifdef(DEBUG).
+-define(debug(Fmt, Arg), io:format(Fmt, Arg)).
+-else.
+-define(debug(Fmt, Arg), ok).
+-endif.
 
 -record(qentry, {table, key, expires}).
 -record(state, {db, queue, mode, tables = sets:new()}).
@@ -64,7 +70,8 @@ init(_Args) ->
 		[] -> queue;
 		_  -> store
 	end,
-	error_logger:info_msg("~p (init): starting in ~p mode, tracking ~p~n", [?MODULE, Mode, sets:to_list(Tables)]),
+	error_logger:info_msg("~p (init): starting in ~p mode, tracking ~p~n", 
+		[?MODULE, Mode, sets:to_list(Tables)]),
 	{ok, #state{db=Db, mode=Mode, queue=queue:new(), tables=Tables}}.
 
 handle_call(_Any, _From, State) -> 
@@ -117,44 +124,48 @@ handle_info({mnesia_table_event, {delete, schema, {schema, Table, _Attrs}, _,
 		false -> 
 			{noreply, State, ?DEQUEUE_TIMEOUT}
 	end;
-handle_info({mnesia_table_event, {write, Table, Record, [], _ActId}}, State) when State#state.mode == queue -> 
+handle_info({mnesia_table_event, {write, Table, Record, [], _ActId}}, State) ->
 	Nq = case sets:is_element(Table, State#state.tables) of 
 		false -> State#state.queue;
 		true  -> 
-			queue:in(#qentry{table=Table, key=element(2, Record), expires=expires()}, State#state.queue)
+			case State#state.mode of 
+				store -> 
+					?debug("reunion(store): storing {~p, ~p}", [Table, element(2, Record)]),
+					ets:insert(?TABLE, {Table, element(2, Record)});
+				queue -> ok
+			end,
+			queue:in(#qentry{table=Table, key=element(2, Record), expires=expires()}, 
+				State#state.queue)
 	end,
-	{noreply, State#state{queue=Nq}, ?DEQUEUE_TIMEOUT};
-handle_info({mnesia_table_event, {write, Table, Record, [], _ActId}}, State) when State#state.mode == store -> 
-	Nq = case sets:is_element(Table, State#state.tables) of 
-		false -> State#state.queue;
-		true  -> 
-			queue:in(#qentry{table=Table, key=element(2, Record), expires=expires()}, State#state.queue)
-	end,
-	ets:insert(?TABLE, {Table, element(2, Record)}),
 	{noreply, State#state{queue=Nq}, ?DEQUEUE_TIMEOUT};
 handle_info({mnesia_table_event, {write, _Table, _Record, _NonEmptyList, _Act}}, State) -> 
 	% this is update of already existing key, may ignore
 	{noreply, State, ?DEQUEUE_TIMEOUT};
 handle_info({mnesia_table_event, {delete, Table, {Table, Key}, _Value, _ActId}}, State) -> 
 	Nq = case sets:is_element(Table, State#state.tables) of 
-		true -> unqueue(State#state.queue, Table, Key);
-		false -> State#state.queue
+		true -> 
+			ets:delete_object(?TABLE, {Table, Key}),
+			unqueue(State#state.queue, Table, Key);
+		false -> 
+			State#state.queue
 	end,
-	ets:delete_object(?TABLE, {Table, Key}),
 	{noreply, State#state{queue=Nq}, ?DEQUEUE_TIMEOUT};
 handle_info({mnesia_table_event, {delete, Table, Record, _Old, _ActId}}, State) -> 
 	Key = element(2, Record),
 	Nq = case sets:is_element(Table, State#state.tables) of 
-		true -> unqueue(State#state.queue, Table, Key);
-		false -> State#state.queue
+		true -> 
+			ets:delete_object(?TABLE, {Table, Key}),
+			unqueue(State#state.queue, Table, Key);
+		false -> 
+			State#state.queue
 	end,
-	ets:delete_object(?TABLE, {Table, Key}),
 	{noreply, State#state{queue=Nq}, ?DEQUEUE_TIMEOUT};
 handle_info({mnesia_system_event, {mnesia_up, Node}}, State) when 
 	State#state.mode == store -> 
 	Mode = case nextmode() of 
 		store -> store;
 		queue -> 
+			?debug("reunion(store->queue): removing all keys", []),
 			ets:delete_all_objects(?TABLE),
 			queue
 	end,
@@ -176,8 +187,10 @@ handle_info({mnesia_system_event, {inconsistent_database, Context, Node}}, State
 			error_logger:info_msg("~p: have global lock. mnesia locks: ~p", 
 				[?MODULE, mnesia_locker:get_held_locks()]),
 			error_logger:info_msg("~p: nodes: ~p, running: ~p, ~p messages: ~p", 
-				[?MODULE, mnesia:system_info(db_nodes), mnesia:system_info(running_db_nodes),
-				process_info(self(), message_queue_len), process_info(self(), messages)]),
+				[?MODULE, mnesia:system_info(db_nodes), 
+					mnesia:system_info(running_db_nodes), 
+					process_info(self(), message_queue_len), 
+					process_info(self(), messages)]),
 			stitch_together(Node)
 		end),
 	error_logger:info_msg("~p: stitching with ~p: ~p", [?MODULE, Node, Res]),
@@ -253,6 +266,7 @@ queue_mirror(Queue) ->
 	case queue:out(Queue) of
 		{empty, Queue} -> ok;
 		{{value, #qentry{table=T, key=K}}, Q1} -> 
+			?debug("reunion(queue_mirror): storing {~p, ~p}", [T, K]),
 			ets:insert(?TABLE, {T, K}),
 			queue_mirror(Q1)
 	end.
@@ -331,6 +345,7 @@ run_stitch(#s0{module=M, function=F, table=Tab, remote=Remote, type=Type,
 	lists:foldl(fun(K, Sx) -> 
 		A = mnesia:read({Tab, K}),
 		B = remote_object(Remote, Tab, K), 
+		error_logger:info_msg("reunion checking ~p (~p) ~p vs. ~p", [Tab, Type, A, B]),
 		case {A, B} of 
 			{[], []} -> 
 				% element is not present anymore
@@ -342,8 +357,12 @@ run_stitch(#s0{module=M, function=F, table=Tab, remote=Remote, type=Type,
 				% remote element is not present
 				case is_locally_inserted(Tab, K) of 
 					true -> 
+						?debug("reunion(stitch ~p ~p ~p ~p): write remote", 
+							[Tab, Type, A, B]),
 						write(Remote, Aa);
 					false -> 
+						?debug("reunion(stitch ~p ~p ~p ~p): delete local", 
+							[Tab, Type, A, B]),
 						delete(Aa)
 				end,
 				Sx;
@@ -351,27 +370,41 @@ run_stitch(#s0{module=M, function=F, table=Tab, remote=Remote, type=Type,
 				% local element not present
 				case is_remotely_inserted(Tab, K, Remote) of 
 					true -> 
+						?debug("reunion(stitch ~p ~p ~p ~p): write local", 
+							[Tab, Type, A, B]),
 						write(Bb);
 					false -> 
+						?debug("reunion(stitch ~p ~p ~p ~p): delete remote", 
+							[Tab, Type, A, B]),
 						delete(Remote, Bb)
 				end,
 				Sx;
 			{[Aa], [Bb]} when Type == set -> 
 				Sn = case M:F(Aa, Bb, Sx) of 
 					{ok, left, Sr} -> 
+						?debug("reunion(stitch ~p ~p ~p ~p): left, write remote", 
+							[Tab, Type, A, B]),
 						write(Remote, Aa), 
 						Sr;
 					{ok, right, Sr} -> 
+						?debug("reunion(stitch ~p ~p ~p ~p): right, write local", 
+							[Tab, Type, A, B]),
 						write(Bb), Sr;
 					{ok, both, Sr} when Type == bag -> 
+						?debug("reunion(stitch ~p ~p ~p ~p): both, write both", 
+							[Tab, Type, A, B]),
 						write(Bb),
 						write(Remote, Aa), 
 						Sr;
 					{ok, neither, Sr} -> 
+						?debug("reunion(stitch ~p ~p ~p ~p): neither, delete both", 
+							[Tab, Type, A, B]),
 						delete(Aa),
 						delete(Remote, Bb), 
 						Sr;
 					{inconsistency, Error, Sr} -> 
+						?debug("reunion(stitch ~p ~p ~p ~p): inconsistency ~p", 
+							[Tab, Type, A, B, Error]),
 						report_inconsistency(Tab, Aa, Bb, Error),
 						Sr
 				end,
