@@ -465,7 +465,7 @@ handle_remote({write, A}, _) ->
 handle_remote({delete, A}, _) -> 
 	delete(A);
 handle_remote({get_keys, Tab}, Pid) ->  % XXXXX - implement Pid tracking
-	ets:lookup(?TABLE, Tab);
+	mnesia:dirty_all_keys(Tab);
 handle_remote({get_object, Tab, Key}, _Pid) -> 
 	mnesia:dirty_read({Tab, Key});
 handle_remote({is_locally_inserted, Tab, Key}, _Pid) -> 
