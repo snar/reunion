@@ -135,8 +135,8 @@ handle_info({mnesia_table_event, {write, Table, Record, [], _ActId}}, State) ->
 					ets:insert(?TABLE, {Table, element(2, Record)});
 				queue -> ok
 			end,
-			?debug("reunion(~p): queueing {~p, ~p}~n", 
-					[State#state.mode, Table, element(2, Record)]),
+			?debug("reunion(~p): queueing {~p, ~p}, expires: ~p~n", 
+					[State#state.mode, Table, element(2, Record), expires()]),
 			queue:in(#qentry{table=Table, key=element(2, Record), expires=expires()}, 
 				State#state.queue)
 	end,
@@ -189,7 +189,8 @@ handle_info({mnesia_system_event, {inconsistent_database, Context, Node}}, State
 		fun() -> 
 			error_logger:info_msg("~p: have global lock. mnesia locks: ~p", 
 				[?MODULE, mnesia_locker:get_held_locks()]),
-			error_logger:info_msg("~p: nodes: ~p, running: ~p, ~p messages: ~p", 
+			error_logger:info_msg("~p: nodes: ~p,~n   running: ~p,~n"
+				"   ~p messages: ~p~n", 
 				[?MODULE, mnesia:system_info(db_nodes), 
 					mnesia:system_info(running_db_nodes), 
 					process_info(self(), message_queue_len), 
@@ -225,7 +226,7 @@ should_track(Attr) ->
 	if 
 		LocalContent == true -> 
 			false;
-		Type =/= set -> 
+		Type == bag ->  % sets and ordered_sets are ok
 			false;
 		length(AllNodes) == 1 ->
 			false;
@@ -239,11 +240,10 @@ expires() ->
 dequeue(Queue, Now) -> 
 	case queue:out(Queue) of 
 		{empty, Queue} -> Queue;
-		{{value, #qentry{expires=Exp} = Qe}, _Q1} when Exp < Now -> 
-			?debug("reunion(dequeue): not expiring ~p~n", [Qe]),
+		{{value, #qentry{expires=Exp}}, _Q1} when Exp > Now -> 
 			Queue;
 		{{value, #qentry{} = _Qe}, Q1} -> 
-			?debug("reunion(dequeue): expired ~p~n", [_Qe]),
+			?debug("reunion(dequeue): expired ~p (~p)~n", [_Qe, Now]),
 			dequeue(Q1, Now)
 	end.
 
@@ -334,7 +334,7 @@ stitch_tabs(TabMethods, Node) ->
 	[ do_stitch(TM, Node) || TM <- TabMethods ].
 
 do_stitch({Tab, _Nodes, {M, F, Xargs}}, Node) -> 
-	Type  = mnesia:table_info(Tab, type),
+	Type  = case mnesia:table_info(Tab, type) of ordered_set -> set; S -> S end,
 	Attrs = mnesia:table_info(Tab, attributes),
 	{ok, Ms} = M:F(init, {Tab, Type, Attrs, Xargs}, Node),
 	S0 = #s0{module = M, function=F, xargs=Xargs, table=Tab, type=Type,
@@ -353,7 +353,6 @@ run_stitch(#s0{module=M, function=F, table=Tab, remote=Remote, type=Type,
 	lists:foldl(fun(K, Sx) -> 
 		A = mnesia:read({Tab, K}),
 		B = remote_object(Remote, Tab, K), 
-		error_logger:info_msg("reunion checking ~p (~p) ~p vs. ~p", [Tab, Type, A, B]),
 		case {A, B} of 
 			{[], []} -> 
 				% element is not present anymore
@@ -416,11 +415,29 @@ run_stitch(#s0{module=M, function=F, table=Tab, remote=Remote, type=Type,
 						report_inconsistency(Tab, Aa, Bb, Error),
 						Sr
 				end,
+				Sn;
+			{[Aa], [Bb]} when Type == bag -> 
+				Sn = case M:F(Aa, Bb, Sx) of 
+					{ok, Actions, Sr} -> 
+						do_actions(Actions, Remote),
+						Sr
+				end,
 				Sn
 		end
 		end, MSt, Keys),
 	M:F(done, MSt, Remote),
 	ok.
+
+do_actions([], _) -> 
+	ok;
+do_actions([{write_local, Ae}|Next], Remote) -> 
+	write(Ae), do_actions(Next, Remote);
+do_actions([{delete_local, Ae}|Next], Remote) -> 
+	delete(Ae), do_actions(Next, Remote);
+do_actions([{write_remote, Ae}|Next], Remote) -> 
+	write(Remote, Ae), do_actions(Next, Remote);
+do_actions([{delete_remote, Ae}|Next], Remote) -> 
+	delete(Remote, Ae), do_actions(Next, Remote).
 
 affected_tables(IslandB) -> 
 	IslandA = mnesia:system_info(running_db_nodes),
@@ -437,7 +454,7 @@ affected_tables(IslandB) ->
 		end end, [], Tables).
 
 write(Remote, A) -> 
-	ask_remote(Remote, {write, A}).
+	rpc:call(Remote, mnesia, dirty_write, [A]).
 
 write(A) when is_list(A) -> 
 	lists:foreach(fun(E) -> mnesia:dirty_write(E) end, A);
@@ -445,7 +462,7 @@ write(A) ->
 	mnesia:dirty_write(A).
 
 delete(Remote, A) -> 
-	ask_remote(Remote, {delete, A}).
+	rpc:call(Remote, mnesia, dirty_delete_object, [A]).
 
 delete(A) when is_list(A) -> 
 	lists:foreach(fun(E) -> mnesia:dirty_delete_object(E) end, A);
@@ -460,7 +477,7 @@ remote_object(Remote, Tab, Key) ->
 
 ask_remote(Remote, Query) -> 
 	case rpc:call(Remote, ?MODULE, handle_remote, [Query, self()]) of 
-		{badrpc, Reason} -> 
+		{badrpc, {'EXIT', {undef, [{?MODULE, handle_remote, _, _}, _]} -> 
 			error_logger:error_msg("~p: unable to query ~p for "
 				"handle_remote(~p): ~p", [?MODULE, Remote, Query, Reason]),
 			error(badrpc);
