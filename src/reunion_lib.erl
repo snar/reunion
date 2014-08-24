@@ -24,7 +24,7 @@ last_version(done, _State, _Node) ->
 last_version(A, B, {set, Field}) when is_tuple(A), is_tuple(B) -> 
 	case element(Field, A) >= element(Field, B) of 
 		true -> {ok, left, Field};
-		false -> {ok, rigth, Field}
+		false -> {ok, right, Field}
 	end;
 last_version(A, B, {bag, Vfield, Ifield} = State) -> 
 	Actions = merge_versioned(A, B, Vfield, Ifield, []),

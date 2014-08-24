@@ -8,8 +8,8 @@
 -export([start/0]).
 
 start() -> 
-	ensure_started(mnesia),
-	ensure_started(lager),
+	application:ensure_all_started(sasl),
+	application:ensure_all_started(mnesia),
 	application:start(reunion).
 
 %% ===================================================================
@@ -22,10 +22,3 @@ start(_StartType, _StartArgs) ->
 stop(_State) ->
 	ok.
 
-ensure_started(App) -> 
-	case application:start(App) of
-		ok -> ok;
-		{error, {already_started, App}} -> ok;
-		{error, {not_started, Dep}} -> 
-			ensure_started(Dep), ensure_started(App)
-	end.
