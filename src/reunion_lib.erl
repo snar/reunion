@@ -2,6 +2,7 @@
 -export([merge_only/3, last_version/3, last_modified/3]).
 
 merge_only(init, {_,set,_,_}, _) -> {ok, set};
+merge_only(init, {_,bag,_,_}, _) -> {ok, bag};
 merge_only(done, _, _) -> ok;
 merge_only(A, B, set) -> 
 	{inconsistency, {merge, A, B}, set};
@@ -21,10 +22,10 @@ last_version(init, {Table, bag, Attrs, [VField, IField|_]}, _Node) ->
 	{ok, {bag, pos(VField, Table, Attrs), pos(IField, Table, Attrs)}};
 last_version(done, _State, _Node) -> 
 	ok;
-last_version(A, B, {set, Field}) when is_tuple(A), is_tuple(B) -> 
+last_version(A, B, {set, Field} = Ms) when is_tuple(A), is_tuple(B) -> 
 	case element(Field, A) >= element(Field, B) of 
-		true -> {ok, left, Field};
-		false -> {ok, right, Field}
+		true -> {ok, left, Ms};
+		false -> {ok, right, Ms}
 	end;
 last_version(A, B, {bag, Vfield, Ifield} = State) -> 
 	Actions = merge_versioned(A, B, Vfield, Ifield, []),
@@ -60,6 +61,9 @@ merge_versioned([A|NextA], B, VF, IF, Acts) ->
 		false -> 
 			% no corresponding element int set B at all, write remotely
 			merge_versioned(NextA, B, VF, IF, [{write_remote, A}|Acts]);
+		{value, A,  NextB} -> 
+			% elements are equal, no action required 
+			merge_versioned(NextA, NextB, VF, IF, Acts);
 		{value, Bb, NextB} -> 
 			% there is a corresponding element. check version
 			Bvers = element(VF, Bb),
