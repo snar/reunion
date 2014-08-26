@@ -3,8 +3,8 @@ reunion
 =======
 
 This is another approach to make `mnesia` more partition-tolerant. 
-Not 100% accurate (see below for known problems), but it's much better
-than default "do not even try to recover after split".
+Results are not 100% accurate (see below for known problems), but it's much 
+better than default "do not even try to recover after split".
 
 Usage:
 ------
@@ -72,7 +72,7 @@ be ready to be called with:
 		{ok, Modstate :: any()};
 	function(done, Modstate, Remote :: atom()) -> 
 		any();
-	function(A, B, Modstate :: any()) -> 
+	function(LocalObject :: any(), RemoteObject :: any(), Modstate :: any()) -> 
 		{ok, Actions :: list(action()), NextState} | 
 		{ok, left, NextState}    | 
 		{ok, right, NextState}   | 
