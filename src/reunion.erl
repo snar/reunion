@@ -81,12 +81,8 @@ handle_info({mnesia_table_event, {write, schema, {schema, Table, Attrs}, _,
 		{true, true} -> 
 			{noreply, State};
 		{true, false} -> 
-			case mnesia:subscribe({table, Table, detailed}) of 
-				{ok, _} -> ok;
-				{error,{not_active_local,Table}} -> 
-					?debug("reunion: unable to subscribe to ~p, not yet active~n", [Table]),
-					erlang:start_timer(?RESUBSCRIBE_TIMEOUT, self(), {subscribe, Table})
-			end,
+			ok = mnesia:wait_for_tables([Table], 1000),
+			{ok, _} = mnesia:subscribe({table, Table, detailed}),
 			error_logger:info_msg("~p: starting tracking ~p", [?MODULE, Table]),
 			Ns = sets:add_element(Table, State#state.tables),
 			{noreply, State#state{tables=Ns}};
@@ -274,16 +270,6 @@ handle_info({timeout, Ref, expire}, #state{exptimer=Ref} = State) ->
 	Now = os:timestamp(),
 	Queue = dequeue(State#state.queue, Now),
 	{noreply, State#state{queue=Queue, exptimer=ETimer}};
-handle_info({timeout, _, {subscribe, Table}}, State) -> 
-	case mnesia:subscribe({table, Table, detailed}) of 
-		{ok, _} -> 
-			?debug("reunion({subscribe, ~p}): ok~n", [Table]),
-			ok;
-		{error, {not_active_local, Table}} -> 
-			?debug("reunion({subscribe, ~p}): still not active local~n", [Table]),
-			erlang:start_timer(?RESUBSCRIBE_TIMEOUT, self(), {subscribe, Table})
-	end,
-	{noreply, State};
 handle_info({mnesia_system_event,{mnesia_info, _, _}}, State) -> 
 	{noreply, State};
 handle_info({mnesia_system_event, {mnesia_down, _Node}}, State) 
