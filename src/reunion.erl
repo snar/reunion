@@ -13,12 +13,16 @@
 -define(LOCK, {?MODULE, lock}).
 -define(DEFAULT_METHOD, {reunion_lib, merge_only, []}).
 -define(DONE, {?MODULE, merge_done}).
--define(DEBUG, 1).
+-define(RESUBSCRIBE_TIMEOUT, 100).
 -ifdef(DEBUG).
--define(debug(Fmt, Arg), io:format(Fmt, Arg)).
+-define(debug(Fmt, Arg), error_logger:info_msg(Fmt, Arg)).
 -else.
 -define(debug(Fmt, Arg), ok).
 -endif.
+
+-type action() :: {'write_local', any()} | {'write_remote', any()} | 
+	{'delete_local', any()} | {'delete_remote', any()}.
+-export_type([action/0]).
 
 -record(qentry, {table, key, expires, op, created = os:timestamp()}).
 -record(state, {db, queue, mode, tables = sets:new(), exptimer, pingtimer}).
@@ -37,7 +41,7 @@ init(_Args) ->
 		(schema, Acc) -> Acc;
 		(T, Acc) -> 
 			Attrs = mnesia:table_info(T, all),
-			case should_track(Attrs) of 
+			case should_track(T, Attrs) of 
 				true -> 
 					mnesia:subscribe({table, T, detailed}),
 					sets:add_element(T, Acc);
@@ -69,10 +73,16 @@ handle_info({mnesia_table_event, {write, schema, {schema, schema, _Attrs}, _,
 	{noreply, State};
 handle_info({mnesia_table_event, {write, schema, {schema, Table, Attrs}, _, 
 	_ActId}}, State) ->
-	case {should_track(Attrs), sets:is_element(Table, State#state.tables)} of 
+	case {should_track(Table, Attrs), sets:is_element(Table, State#state.tables)} of 
 		{true, true} -> 
 			{noreply, State};
 		{true, false} -> 
+			case mnesia:subscribe({table, Table, detailed}) of 
+				{ok, _} -> ok;
+				{error,{not_active_local,Table}} -> 
+					?debug("reunion: unable to subscribe to ~p, not yet active~n", [Table]),
+					erlang:start_timer(?RESUBSCRIBE_TIMEOUT, self(), {subscribe, Table})
+			end,
 			error_logger:info_msg("~p: starting tracking ~p", [?MODULE, Table]),
 			Ns = sets:add_element(Table, State#state.tables),
 			{noreply, State#state{tables=Ns}};
@@ -82,7 +92,7 @@ handle_info({mnesia_table_event, {write, schema, {schema, Table, Attrs}, _,
 				queue -> 
 					unqueue(State#state.queue, Table);
 				store -> 
-					ets:match_delete(?TABLE, {{Table, '_'}, '_'}),
+					ets:match_delete(?TABLE, {{Table, '_'}, '_', '_'}),
 					State#state.queue
 			end,
 			Ns = sets:del_element(Table, State#state.tables),
@@ -100,7 +110,7 @@ handle_info({mnesia_table_event, {delete, schema, {schema, Table, _Attrs}, _,
 				queue -> 
 					unqueue(State#state.queue, Table);
 				store -> 
-					ets:match_delete(?TABLE, {{Table,'_'}, '_'}),
+					ets:match_delete(?TABLE, {{Table,'_'}, '_', '_'}),
 					State#state.queue
 			end,
 			Ns = sets:del_element(Table, State#state.tables),
@@ -111,6 +121,7 @@ handle_info({mnesia_table_event, {delete, schema, {schema, Table, _Attrs}, _,
 handle_info({mnesia_table_event, {write, Table, Record, [], _ActId}}, State) ->
 	Nq = case sets:is_element(Table, State#state.tables) of 
 		false -> 
+			?debug("reunion(write new): table ~p is not tracked~n", [Table]),
 			State#state.queue;
 		true  -> 
 			case State#state.mode of 
@@ -131,6 +142,7 @@ handle_info({mnesia_table_event, {write, Table, Record, [], _ActId}}, State) ->
 handle_info({mnesia_table_event, {write, _Table, _Record, _NonEmptyList, _Act}},
 	State) -> 
 	% this is update of already existing key, may ignore
+	?debug("reunion(update, ignored): table ~p, ~p~n", [_Table, _Record]),
 	{noreply, State};
 handle_info({mnesia_table_event, {delete, Table, {Table, Key}, _Value, _ActId}},
 	State) -> 
@@ -155,7 +167,7 @@ handle_info({mnesia_table_event, {delete, Table, Record, _Old, _ActId}},
 		true -> 
 			case State#state.mode of 
 				store -> 
-					ets:insert(?TABLE, {{Table, Key}, 'delete', os:timstamp()}),
+					ets:insert(?TABLE, {{Table, Key}, 'delete', os:timestamp()}),
 					State#state.queue;
 				queue -> 
 					queue:in(#qentry{table=Table, key=Key, expires=expires(),
@@ -195,16 +207,22 @@ handle_info({mnesia_system_event, {mnesia_down, Node}}, State) when node() == No
 	{stop, normal, State};
 handle_info({mnesia_system_event, {mnesia_down, Node}}, State) when 
 	State#state.mode == queue -> 
-	% mirror all queued entries to ets
-	queue_mirror(State#state.queue),
 	error_logger:info_msg("~p: got mnesia_down ~p in queue mode, switching to store", 
 		[?MODULE, Node]),
+	% mirror all queued entries to ets
+	queue_mirror(State#state.queue),
 	Ping = erlang:start_timer(?PING_TIMEOUT, ?MODULE, ping),
 	{noreply, State#state{mode=store, pingtimer=Ping}};
 handle_info({mnesia_system_event, {inconsistent_database, running_partitioned_network, 
 	Node}}, State) -> 
 	error_logger:info_msg("~p: Inconsistency (running_partitioned_network) with ~p~n",
 		[?MODULE, Node]),
+	case application:get_env(?MODULE, delay, 0) of 
+		0 -> ok;
+		Value -> 
+			?debug("reunion: sleeping ~p before acquiring lock", [Value]),
+			timer:sleep(Value)
+	end,
 	Res = global:trans({?LOCK, self()}, 
 		fun() -> 
 			?debug("~p: have global lock. mnesia locks: ~p", 
@@ -252,6 +270,16 @@ handle_info({timeout, Ref, expire}, #state{exptimer=Ref} = State) ->
 	Now = os:timestamp(),
 	Queue = dequeue(State#state.queue, Now),
 	{noreply, State#state{queue=Queue, exptimer=ETimer}};
+handle_info({timeout, _, {subscribe, Table}}, State) -> 
+	case mnesia:subscribe({table, Table, detailed}) of 
+		{ok, _} -> 
+			?debug("reunion({subscribe, ~p}): ok~n", [Table]),
+			ok;
+		{error, {not_active_local, Table}} -> 
+			?debug("reunion({subscribe, ~p}): still not active local~n", [Table]),
+			erlang:start_timer(?RESUBSCRIBE_TIMEOUT, self(), {subscribe, Table})
+	end,
+	{noreply, State};
 handle_info({mnesia_system_event,{mnesia_info, _, _}}, State) -> 
 	{noreply, State};
 handle_info({mnesia_system_event, {mnesia_down, _Node}}, State) 
@@ -268,18 +296,24 @@ terminate(Reason, _State) ->
 code_change(_Old, State, _Extra) -> 
 	{ok, State}.
 
-should_track(Attr) -> 
+should_track(_T, Attr) -> 
 	LocalContent = proplists:get_value(local_content, Attr),
 	Type = proplists:get_value(type, Attr),
 	AllNodes = proplists:get_value(all_nodes, Attr),
 	if 
 		LocalContent == true -> 
+			?debug("reunion: should not track ~p: local_content only~n", [_T]),
 			false;
 		Type == bag ->  % sets and ordered_sets are ok
+			?debug("reunion: should not track ~p: bag~n", [_T]),
 			false;
 		length(AllNodes) == 1 ->
+			?debug("reunion: should not track ~p: all_nodes ~p~n", 
+				[_T, AllNodes]),
 			false;
-		true -> true
+		true -> 
+			?debug("reunion: should track ~p~n", [_T]),
+			true
 	end.
 
 expires() -> 
@@ -320,9 +354,9 @@ nextmode() ->
 queue_mirror(Queue) -> 
 	case queue:out(Queue) of
 		{empty, Queue} -> ok;
-		{{value, #qentry{table=T, key=K, op=Op}}, Q1} -> 
-			?debug("reunion(queue_mirror): storing {~p, ~p}~n", [T, K]),
-			ets:insert(?TABLE, {{T, K}, Op}),
+		{{value, #qentry{table=T, key=K, op=Op, created=C}}, Q1} -> 
+			?debug("reunion(queue_mirror): storing {~p, ~p}, ~p~n", [T, K, Op]),
+			ets:insert(?TABLE, {{T, K}, Op, C}),
 			queue_mirror(Q1)
 	end.
 
@@ -356,6 +390,8 @@ do_stitch_together(Node) ->
 			Answer
 	end,
 	TabsAndNodes = affected_tables(IslandB),
+	error_logger:info_msg("tabs and nodes: ~p, my tables: ~p", [TabsAndNodes,
+		mnesia:system_info(tables) -- [schema]]),
 	Tables = [ T || {T, _} <- TabsAndNodes ],
 	DefaultMethod = default_method(),
 	TabMethods = [{T, Ns, get_method(T, DefaultMethod)} || 
@@ -409,14 +445,27 @@ run_stitch(#s0{module=M, function=F, table=Tab, remote=Remote, type=Type,
 				Sx;
 			{Aa, Aa} -> 
 				% elements are the same
+				?debug("reunion(~p, ~p): same element ~p", [Tab, K, Aa]),
 				Sx;
 			{[Aa], []} when Type == set -> 
 				% remote element is not present
 				case is_locally_inserted(Tab, K) of 
-					true -> 
-						?debug("reunion(stitch ~p ~p ~p ~p): write remote~n", 
-							[Tab, Type, A, B]),
-						write(Remote, Aa);
+					{true, LocalTime} -> 
+						case rpc:call(Remote, reunion, is_locally_removed, [Tab, K]) of 
+							false ->
+								?debug("reunion(stitch ~p ~p ~p ~p): write remote "
+									"(not removed)~n", 
+									[Tab, Type, A, B]),
+								write(Remote, Aa);
+							{true, RemoteTime} when LocalTime < RemoteTime -> 
+								?debug("reunion(stitch ~p ~p ~p ~p): delete local~n", 
+									[Tab, Type, A, B]),
+								delete(Aa);
+							_ ->  % can be an error too
+								?debug("reunion(stitch ~p ~p ~p ~p): write remote~n", 
+									[Tab, Type, A, B]),
+								write(Remote, Aa)
+						end;
 					false -> 
 						?debug("reunion(stitch ~p ~p ~p ~p): delete local~n", 
 							[Tab, Type, A, B]),
@@ -426,10 +475,21 @@ run_stitch(#s0{module=M, function=F, table=Tab, remote=Remote, type=Type,
 			{[], [Bb]} when Type == set -> 
 				% local element not present
 				case is_locally_removed(Tab, K) of 
-					true -> 
-						?debug("reunion(stitch ~p ~p ~p ~p): delete remote~n", 
-							[Tab, Type, A, B]),
-						delete(Remote, Bb);
+					{true, LocalTime} -> 
+						case rpc:call(Remote, ?MODULE, is_locally_inserted, [Tab, K]) of 
+							false -> 
+								?debug("reunion(stitch ~p ~p ~p ~p): delete remote~n", 
+									[Tab, Type, A, B]),
+								delete(Remote, Bb);
+							{true, RemoteTime} when LocalTime < RemoteTime -> 
+								?debug("reunion(stitch ~p ~p ~p ~p): write local~n", 
+									[Tab, Type, A, B]),
+								write(Bb);
+							_ -> 
+								?debug("reunion(stitch ~p ~p ~p ~p): delete remote~n", 
+									[Tab, Type, A, B]),
+								delete(Remote, Bb)
+						end;
 					false -> 
 						?debug("reunion(stitch ~p ~p ~p ~p): write local~n", 
 							[Tab, Type, A, B]),
@@ -493,12 +553,9 @@ affected_tables(IslandB) ->
 	IslandA = mnesia:system_info(running_db_nodes),
 	Tables = mnesia:system_info(tables) -- [schema], 
 	lists:foldl(fun(T, Acc) -> 
-		Attrs = mnesia:table_info(T, all),
-		Tracked = should_track(Attrs),
 		Nodes = mnesia:table_info(T, all_nodes),
-		case {intersection(IslandA, Nodes), intersection(IslandB, Nodes), 
-			Tracked} of 
-			{[_|_], [_|_], true} -> 
+		case {intersection(IslandA, Nodes), intersection(IslandB, Nodes)} of 
+			{[_|_], [_|_]} -> 
 				[{T, Nodes}|Acc];
 			_ -> Acc
 		end end, [], Tables).
@@ -542,10 +599,10 @@ is_locally_inserted(Tab, Key) ->
 		[] -> 
 			?debug("reunion(is_locally_inserted): {~p, ~p} not in ets~n", [Tab, Key]),
 			false;
-		[{{Tab, Key}, 'insert'}] -> 
+		[{{Tab, Key}, 'insert', T}] -> 
 			?debug("reunion(is_locally_inserted): {~p, ~p} was inserted~n", [Tab, Key]),
-			true;
-		[{{Tab, Key}, 'delete'}] -> 
+			{true, T};
+		[{{Tab, Key}, 'delete', _}] -> 
 			?debug("reunion(is_locally_inserted): {~p, ~p} was deleted~n", [Tab, Key]),
 			false
 	end.
@@ -555,12 +612,12 @@ is_locally_removed(Tab, Key) ->
 		[] -> 
 			?debug("reunion(is_locally_removed): {~p, ~p} not in ets~n", [Tab, Key]),
 			false;
-		[{{Tab, Key}, 'insert'}] -> 
+		[{{Tab, Key}, 'insert', _}] -> 
 			?debug("reunion(is_locally_removed): {~p, ~p} was inserted~n", [Tab, Key]),
 			false;
-		[{{Tab, Key}, 'delete'}] -> 
+		[{{Tab, Key}, 'delete', T}] -> 
 			?debug("reunion(is_locally_removed): {~p, ~p} was deleted~n", [Tab, Key]),
-			true
+			{true, T}
 	end.
 
 check_inconsistencies() -> 

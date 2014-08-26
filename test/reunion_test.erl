@@ -12,15 +12,19 @@ reunion_test_() ->
 			fun merge_only/0,
 			fun last_version_set/0,
 			fun last_modified_set/0,
+			fun last_version_bag/0,
+			fun last_modified_bag/0,
 			fun distributed_set/0
 		]
 	}.
 
 start() -> 
+	application:ensure_all_started(mnesia),
+	application:ensure_all_started(reunion),
 	{atomic, ok} = mnesia:create_table(reunion_test_set, [{attributes, [key, value]},
-		{ram_copies, nodes()}]),
+		{ram_copies, [node()|nodes()]}]),
 	{atomic, ok} = mnesia:create_table(reunion_test_bag, [{type, bag}, 
-		{attributes, [key, value, modified]}, {ram_copies, nodes()}]).
+		{attributes, [key, value, modified]}, {ram_copies, [node()|nodes()]}]).
 
 stop() -> 
 	{atomic, ok} = mnesia:delete_table(reunion_test_set),
@@ -28,16 +32,15 @@ stop() ->
 			
 
 merge_only() -> 
-	Node = hd(nodes() -- [node()]),
 	Ms1 =  reunion_lib:merge_only(init, {set, set, 
-		mnesia:table_info(reunion_test_set, attributes), []}, Node),
+		mnesia:table_info(reunion_test_set, attributes), []}, node),
 	{ok, set} = Ms1,
 	Ms2 =  reunion_lib:merge_only({set, a, b}, {set, b, a}, set),
 	{inconsistency, {merge, {set, a, b}, {set, b, a}}, set} = Ms2,
-	ok  =  reunion_lib:merge_only(done, set, Node),
+	ok  =  reunion_lib:merge_only(done, set, node),
 
 	{ok, bag} = reunion_lib:merge_only(init, {reunion_test_bag, bag, 
-		mnesia:table_info(reunion_test_set, attributes), []}, Node),
+		mnesia:table_info(reunion_test_set, attributes), []}, node),
 
 	{ok, Actions, bag} = reunion_lib:merge_only([{a, a}, {a, b}], [{b, b}, {a, b}], 
 		bag),
@@ -77,18 +80,47 @@ last_version_bag() ->
 	%  - bskey, 1, should be removed remotely and replaced with bskey, 2
         %_ - there should be no changes against cskey
 
-	{{value, {Aal, {tab, key, askey, 0}}}, NextAa} = lists:keytake(
+	{value, {Aal, {tab, key, askey, 0}}, NextAa} = lists:keytake(
 		{tab, key, askey, 0}, 2, Actions),
 	delete_local = Aal,
-	{{value, {Aal1, {tab, key, askey, 1}}}, NextAa1} = lists:keytake(
+	{value, {Aal1, {tab, key, askey, 1}}, NextAa1} = lists:keytake(
 		{tab, key, askey, 1}, 2, NextAa),
 	write_local  = Aal1,
 
-	{{value, {Bar, {tab, key, bskey, 1}}}, NextAb} = lists:keytake(
+	{value, {Bar, {tab, key, bskey, 1}}, NextAb} = lists:keytake(
 		{tab, key, bskey, 1}, 2, NextAa1),
 	delete_remote = Bar,
 
-	{{value, {BBr, {tab, key, bskey, 2}}}, NextAb1} = lists:keytake(
+	{value, {BBr, {tab, key, bskey, 2}}, NextAb1} = lists:keytake(
+		{tab, key, bskey, 2}, 2, NextAb),
+	write_remote = BBr,
+
+	[] = NextAb1.
+
+last_modified_bag() -> 
+	{ok, {bag, 4, 3}} = reunion_lib:last_modified(init, {tab, bag, 
+		[key, skey, modified], [skey]}, node),
+	{ok, Actions, {bag, 4, 3}} = reunion_lib:last_modified(
+		[{tab, key, askey, 0}, {tab, key, bskey, 2}, {tab, key, cskey, 0}],
+		[{tab, key, askey, 1}, {tab, key, bskey, 1}, {tab, key, cskey, 0}],
+		{bag, 4, 3}),
+	% in this simulation we should get following results: 
+	%  - askey, 0, should be removed locally and replaced with askey, 1
+	%  - bskey, 1, should be removed remotely and replaced with bskey, 2
+        %_ - there should be no changes against cskey
+
+	{value, {Aal, {tab, key, askey, 0}}, NextAa} = lists:keytake(
+		{tab, key, askey, 0}, 2, Actions),
+	delete_local = Aal,
+	{value, {Aal1, {tab, key, askey, 1}}, NextAa1} = lists:keytake(
+		{tab, key, askey, 1}, 2, NextAa),
+	write_local  = Aal1,
+
+	{value, {Bar, {tab, key, bskey, 1}}, NextAb} = lists:keytake(
+		{tab, key, bskey, 1}, 2, NextAa1),
+	delete_remote = Bar,
+
+	{value, {BBr, {tab, key, bskey, 2}}, NextAb1} = lists:keytake(
 		{tab, key, bskey, 2}, 2, NextAb),
 	write_remote = BBr,
 
@@ -118,7 +150,7 @@ distrib(Me, MyNode) ->
 	end,
 	receive 
 		{mnesia_system_event, {mnesia_up, MyNode}} -> 
-			check_data(),
+			check_data(node()),
 			Me ! {mnesia_up, node(), MyNode},
 			ok
 	after 100000 -> 
@@ -134,7 +166,9 @@ distributed_set(Node) ->
 	Me = self(),
 	MyNode = node(),
 
-	Pid = erlang:spawn(Node, ?MODULE, distrib, [Me, MyNode]),
+	timer:sleep(1000),
+
+	erlang:spawn(Node, ?MODULE, distrib, [Me, MyNode]),
 	ok = receive 
 		running -> ok
 	after 1000 -> 
@@ -142,6 +176,13 @@ distributed_set(Node) ->
 	end,
 
 	net_kernel:disconnect(Node),
+
+	ok = receive
+		{mnesia_system_event, {mnesia_down, Node}} -> 
+			ok
+	after 1000 -> 
+		timeout
+	end,
 
 	mnesia:dirty_write(#reunion_test_set{key=key3, value=value3}),
 	mnesia:dirty_delete({reunion_test_set, key1}),
@@ -152,7 +193,7 @@ distributed_set(Node) ->
 
 	receive 
 		{mnesia_system_event, {mnesia_up, Node}} -> 
-			check_data()
+			check_data(Node)
 	after 120000 -> 
 		?assert(0)
 	end,
@@ -162,14 +203,25 @@ distributed_set(Node) ->
 	after 10000 -> 
 		?assert(0)
 	end,
-	[{reunion_test_set,key2,value2},
- 		{reunion_test_set,key3,value3},
- 		{reunion_test_set,rkey1,rvalue1}] = 
-		lists:sort(mnesia:dirty_match_object({reunion_test_set, '_', '_'})).
+	Result = [{reunion_test_set,key2,value2}, {reunion_test_set,key3,value3}] ++ 
+		case rpc:call(Node, erlang, whereis, [?MODULE]) of 
+		undefined -> 
+			% key5 was inserted and removed in too short time interval,
+			% this can't be detected without remote helper. 
+			[#reunion_test_set{key=key5, value=value5}];
+		_ -> []
+		end ++
+ 		[{reunion_test_set,rkey1,rvalue1}],
+	Result = lists:sort(mnesia:dirty_match_object({reunion_test_set, '_', '_'})).
 	
-check_data() -> 
+check_data(Remote) -> 
 	[] = mnesia:dirty_read(reunion_test_set, key1),  % removed locally
-	[] = mnesia:dirty_read(reunion_test_set, key5),  % removed remotely
+	Expect = case rpc:call(Remote, erlang, whereis, [?MODULE]) of 
+		undefined -> 
+			[#reunion_test_set{key=key5, value=value5}];
+		_ -> []
+	end,
+	Expect = mnesia:dirty_read(reunion_test_set, key5),  % removed remotely
 	[#reunion_test_set{key=rkey1, value=rvalue1}] = 
 		mnesia:dirty_read(reunion_test_set, rkey1),  % inserted remotely
 	[#reunion_test_set{key=key3, value=value3}] = 
