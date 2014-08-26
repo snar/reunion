@@ -3,7 +3,8 @@ reunion
 =======
 
 This is another approach to make `mnesia` more partition-tolerant. 
-Of course, according to 'CAP Theorem' this can make your data inconsistent.
+Not 100% accurate (see below for known problems), but it's much better
+than default "do not even try to recover after split".
 
 Usage:
 ------
@@ -18,18 +19,22 @@ Advanced usage:
 
 First, some words on "how it works": in the default operation mode (no network
 splits present), `reunion` subscribes to all replicated `set` and `ordered_set` 
-tables in system. When some record is inserted or removes, this change (table
-and key only) is recorded and expired after 60 seconds (as my experiments shows,
-it's enough for erlang to detect network splits). When network split happens,
-all changes are moved to `ets` table and never auto-expired: so, you shall
-be sure that your splits are not long enough to die from out-of-memory.
+tables in system. When some record is inserted or removed, this change (table,
+key, operation and timestamp, not a full record) is recorded and expired after 
+60 seconds (as my experiments shows, it's enough for erlang to detect network splits). 
+
+When network split happens, all changes are moved to `ets` table and never 
+auto-expired: so, you shall be sure that your splits are not long enough to 
+die from out-of-memory.
 
 On recovery `mnesia` initiates system_event `inconsistent_database`, which
-is trapped by `reunion` and then we try to recover system consistency. 
-For each table and for each key in table we are checking if corresponding
-values are present and equal on both nodes. If so, then we just moving to 
+is trapped by `reunion` which tries to recover data consistency.
+
+For each table and for each key in table it checks if corresponding
+values are present and equal on both nodes. If so, then it just movies to 
 next key/next table, but if not...
-For `set`s and `ordered_set`s: 
+
+For `set`'s and `ordered_set`'s: 
 - if we have an object on local node and do not have on remote: 
 we are checking if there is a corresponding 'inserted' change on our node. 
 If so, this difference was caused by local insert, and we push our object to 
@@ -53,27 +58,38 @@ you should set `reunion_compare` attribute of this table to {M, F, A}:
 	(node@host)>mnesia:write_table_property(kvs, {reunion_compare, 
 		{reunion_lib, last_version, [value]}}).
 
+or
+
+	(node@host)>mnesia:write_table_property(kvs, {reunion_compare, 
+		{reunion_lib, last_modified, []}}).
+
 Of course, you are not limited to predefined strategies, and you can 
 provide yours. Your resolution function must be arity-3 function and 
 be ready to be called with: 
 
-function(init, {Table, set | bag, Attributes, XAttributes}, Remote) -> 
-	{ok, Modstate :: any()};
-function(done, Modstate, Remote) -> 
-	any();
-function(A, B, Modstate :: any()) -> 
-	{ok, Actions, NextState} | 
-	{ok, left, NextState}    | 
-	{ok, right, NextState}   | 
-        {ok, both, NextState}    | 
-	{inconsistency, Error, NextState}.
+	function(init, {Table :: atom(), set | bag, Attributes :: list(atom()), 
+		XAttributes :: list(any())}, Remote :: atom()) -> 
+		{ok, Modstate :: any()};
+	function(done, Modstate, Remote :: atom()) -> 
+		any();
+	function(A, B, Modstate :: any()) -> 
+		{ok, Actions :: list(action()), NextState} | 
+		{ok, left, NextState}    | 
+		{ok, right, NextState}   | 
+		{inconsistency, Error, NextState}
+		when Action :: {write_local, Object} | 
+			{write_remote, Object} | 
+			{delete_local, Object} | 
+			{delete_remote, Object}.
 
-For bag tables behaviour is about the same. Major difference: bag keys are not tracked, 
-so there is no easy way to decide if missing object was removed, so it's left to conflict 
-resolution funcions. Default `merge_only` function makes no assumptions and just
-adds missing objects to bags. 
+i hope the names are self-descriptive enough :)
 
-There are also `last_version` and `last_modified` strategies predefined for bags too, 
+For bag tables default behaviour is about the same. Major difference: bag keys are 
+not tracked, so there is no easy way to decide if missing object was removed, so 
+it's left to conflict resolution funcions. Default `merge_only` function makes no 
+assumptions and just adds missing objects to bags. 
+
+Also there are `last_version` and `last_modified` strategies predefined for bags too, 
 but those require your objects to have some `secondary index` field, unique for objects 
 with the same key, and comparison over `version`/`modified` field is done for objects
 with the same `secondary key`. Of course, this means that you shall mention name of 
@@ -99,6 +115,21 @@ reunion can introduce `missing update` problems. This is caused by the
 fact that no table locking used, so objects in mnesia can be changed 
 after object is fetched for compare but before resulting object is 
 written or before mnesia nodes are joined again.
+
+Another interesting edge case: let's assume netsplit happens right after
+creating some record and then record is deleted during netsplit. This can
+be detected and resolved correctly only in case `reuinion` is running on 
+both nodes and clocks are synchronised. If there are no `reunion` on 
+island where record is deleted - this deletion will be missed.
+
+Other approaches:
+-----------------
+
+`reunion` is an "almost complete rewrite" of `unsplit` by Ulf Wiger. 
+Major difference between our approaches: `unsplit` uses a stateless 
+approach and just unable to resolve "object present here and not present 
+there" case: this can be a result of local insertion or remote deletion, 
+and it's not possible to determine what happened without storing this information.
 
 Thanks: 
 -------
