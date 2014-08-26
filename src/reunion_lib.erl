@@ -1,6 +1,17 @@
 -module(reunion_lib).
 -export([merge_only/3, last_version/3, last_modified/3]).
 
+-spec merge_only
+	(init, {atom(), atom(), list(atom()), list(any())}, atom()) -> 
+		{ok, atom()};
+	(done, any(), atom()) -> 
+		ok;
+	(any(), any(), atom()) -> 
+		{ok, list(reunion:action()), atom()} | 
+		{ok, left, atom()} | 
+		{ok, right, atom()} | 
+		{inconsistency, any(), atom()}.
+
 merge_only(init, {_,set,_,_}, _) -> {ok, set};
 merge_only(init, {_,bag,_,_}, _) -> {ok, bag};
 merge_only(done, _, _) -> ok;
@@ -11,10 +22,32 @@ merge_only(A, B, bag) when is_list(A), is_list(B) ->
 	{ok, lists:append([lists:map(fun(Ae) -> {write_remote, Ae} end, Aonly),
 		lists:map(fun(Be) -> {write_local, Be} end, Bonly)]), bag}. 
 
-last_modified(init, {Table, set, Attrs, Xargs}, Node) -> 
-	last_version(init, {Table, set, Attrs, [modified|Xargs]}, Node);
+-spec last_modified
+	(init, {atom(), atom(), list(atom()), list(any())}, atom()) -> 
+		{ok, atom()};
+	(done, any(), atom()) -> 
+		ok;
+	(any(), any(), atom()) -> 
+		{ok, list(reunion:action()), atom()} | 
+		{ok, left, atom()} | 
+		{ok, right, atom()} | 
+		{inconsistency, any(), atom()}.
+
+last_modified(init, {Table, Type, Attrs, Xargs}, Node) -> 
+	last_version(init, {Table, Type, Attrs, [modified|Xargs]}, Node);
 last_modified(A, B, C) -> 
 	last_version(A, B, C).
+
+-spec last_version
+	(init, {atom(), atom(), list(atom()), list(any())}, atom()) -> 
+		{ok, atom()};
+	(done, any(), atom()) -> 
+		ok;
+	(any(), any(), atom()) -> 
+		{ok, list(reunion:action()), atom()} | 
+		{ok, left, atom()} | 
+		{ok, right, atom()} | 
+		{inconsistency, any(), atom()}.
 
 last_version(init, {Table, set, Attrs, [VField|_]}, _Node) -> 
 	{ok, {set, pos(VField, Table, Attrs)}};
