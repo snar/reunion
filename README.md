@@ -21,7 +21,7 @@ First, some words on "how it works": in the default operation mode (no network
 splits present), `reunion` subscribes to all replicated `set` and `ordered_set` 
 tables in system. When some record is inserted or removed, this change (table,
 key, operation and timestamp, not a full record) is recorded and expired after 
-60 seconds (as my experiments shows, it's enough for erlang to detect network splits). 
+`net_kernel:get_net_ticktime()` seconds (maximum time to detect network split).
 
 When network split happens, all changes are moved to `ets` table and never 
 auto-expired: so, you shall be sure that your splits are not long enough to 

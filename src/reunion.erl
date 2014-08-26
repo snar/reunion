@@ -9,7 +9,11 @@
 -define(TABLE, ?MODULE).
 -define(DEQUEUE_TIMEOUT, 1000).
 -define(PING_TIMEOUT, 30000).
--define(EXPIRE_TIMEOUT, 60). % seconds
+-define(EXPIRE_TIMEOUT, case net_kernel:get_net_ticktime() of 
+	ignored -> 60+1; 
+	{ongoing_change_to, Tick} -> Tick+1;
+	Tick -> Tick+1
+end). % seconds
 -define(LOCK, {?MODULE, lock}).
 -define(DEFAULT_METHOD, {reunion_lib, merge_only, []}).
 -define(DONE, {?MODULE, merge_done}).
@@ -320,11 +324,12 @@ expires() ->
 	expires(os:timestamp()).
 
 expires({M, S, Ms}) -> 
-	case S + ?EXPIRE_TIMEOUT >= 1000000 of 
+	Exp = ?EXPIRE_TIMEOUT,
+	case S + Exp >= 1000000 of 
 		true -> 
-			{M+1, S+?EXPIRE_TIMEOUT-1000000, Ms};
+			{M+1, S+Exp-1000000, Ms};
 		false -> 
-			{M, S+?EXPIRE_TIMEOUT, Ms}
+			{M, S+Exp, Ms}
 	end.
 
 dequeue(Queue, Now) -> 
