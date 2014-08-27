@@ -24,7 +24,8 @@ start() ->
 	{atomic, ok} = mnesia:create_table(reunion_test_set, [{attributes, [key, value]},
 		{ram_copies, [node()|nodes()]}]),
 	{atomic, ok} = mnesia:create_table(reunion_test_bag, [{type, bag}, 
-		{attributes, [key, value, modified]}, {ram_copies, [node()|nodes()]}]).
+		{attributes, [key, value, modified]}, {ram_copies, [node()|nodes()]}]),
+	ok = mnesia:wait_for_tables([reunion_test_set, reunion_test_bag], 1000).
 
 stop() -> 
 	{atomic, ok} = mnesia:delete_table(reunion_test_set),
@@ -35,7 +36,7 @@ merge_only() ->
 	Ms1 =  reunion_lib:merge_only(init, {set, set, 
 		mnesia:table_info(reunion_test_set, attributes), []}, node),
 	{ok, set} = Ms1,
-	Ms2 =  reunion_lib:merge_only({set, a, b}, {set, b, a}, set),
+	Ms2 =  reunion_lib:merge_only([{set, a, b}], [{set, b, a}], set),
 	{inconsistency, {merge, {set, a, b}, {set, b, a}}, set} = Ms2,
 	ok  =  reunion_lib:merge_only(done, set, node),
 
@@ -54,18 +55,19 @@ merge_only() ->
 last_version_set() -> 
 	{ok, {set, 3}} = reunion_lib:last_version(init, {table, set, [key, ver], [ver]}, 
 		node),
-	{ok, right, {set, 3}} = reunion_lib:last_version({tab, a, 1}, {tab, a, 2}, 
-		{set, 3}),
-	{ok, left, {set, 3}} = reunion_lib:last_version({tab, a, 2}, {tab, a, 1}, {set, 3}),
+	{ok, {write_local, {tab, a, 2}}, {set, 3}} = 
+		reunion_lib:last_version([{tab, a, 1}], [{tab, a, 2}], {set, 3}),
+	{ok, {write_remote, {tab, a, 2}}, {set, 3}} = 
+		reunion_lib:last_version([{tab, a, 2}], [{tab, a, 1}], {set, 3}),
 	ok = reunion_lib:last_version(done, {set, 3}, node).
 
 last_modified_set() -> 
-	{ok, {set, 3}} = reunion_lib:last_modified(init, {table, set, [key, modified], []},
-		node),
-	{ok, right, {set, 3}} = reunion_lib:last_modified({tab, a, 1}, {tab, a, 2}, 
-		{set, 3}), 
-	{ok, left, {set, 3}} = reunion_lib:last_modified({tab, a, 2}, {tab, a, 1}, 
-		{set, 3}),
+	{ok, {set, 3}} = reunion_lib:last_modified(init, {table, set, 
+		[key, modified], []}, node),
+	{ok, {write_local, {tab, a, 2}}, {set, 3}} = 
+		reunion_lib:last_modified([{tab, a, 1}], [{tab, a, 2}], {set, 3}), 
+	{ok, {write_remote, {tab, a, 2}}, {set, 3}} = 
+		reunion_lib:last_modified([{tab, a, 2}], [{tab, a, 1}], {set, 3}),
 	ok = reunion_lib:last_modified(done, {set, 3}, node).
 	
 last_version_bag() -> 
@@ -130,6 +132,7 @@ last_modified_bag() ->
 distributed_set() -> 
 	case nodes() -- [node()] of 
 		[] -> 
+			timer:sleep(1000), % to make sure that tables activated
 			ok;
 		Nodes -> 
 			distributed_set(hd(Nodes))
@@ -158,11 +161,11 @@ distrib(Me, MyNode) ->
 	end.
 	
 distributed_set(Node) -> 
+	mnesia:subscribe(system),
 	mnesia:dirty_write(#reunion_test_set{key=key1, value=value1}),
 	mnesia:dirty_write(#reunion_test_set{key=key2, value=value2}),
 	mnesia:dirty_write(#reunion_test_set{key=key5, value=value5}),
 
-	mnesia:subscribe(system),
 	Me = self(),
 	MyNode = node(),
 
