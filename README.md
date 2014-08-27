@@ -12,91 +12,67 @@ Usage:
 	(node@host)>application:start(reunion).
 
 This will start `reunion` in default configuraion, tracking all keys in
-`set` and `ordered_set` tables with default strategy of `merge_only`.
+`set` and `ordered_set` tables with default strategy of `merge_only` and 
+trying to reconnect all not running nodes every `net_tick_timeout` seconds.
 
 Advanced usage:
 ---------------
 
-First, some words on "how it works": in the default operation mode (no network
-splits present), `reunion` subscribes to all replicated `set` and `ordered_set` 
-tables in system. When some record is inserted or removed, this change (table,
-key, operation and timestamp, not a full record) is recorded and expired after 
-`net_kernel:get_net_ticktime()` seconds (maximum time to detect network split).
+`reunion` tries to detect two types of collisions: 
+- INSERT/DELETE collision, when some record is present on one node and not present 
+on another.
+- Data Collision, when some record present on both nodes but contents differ.
 
-When network split happens, all changes are moved to `ets` table and never 
-auto-expired: so, you shall be sure that your splits are not long enough to 
-die from out-of-memory.
+In order to resolve first type of collision for `set` tables, `reunion` tracks
+insert and delete operations, storing info about Table, Key, Operation and WhenItHappened
+in internal `ets` table. When collision occurs, `reunion` consults this table
+trying to determine last event for this key and restores record accordingly
+(if last found event is 'insert' - record is re-inserted on node it missed,
+if 'delete' - record is deleted on node it still present).
 
-On recovery `mnesia` initiates system_event `inconsistent_database`, which
-is trapped by `reunion` which tries to recover data consistency.
+For `bag` tables operations are not tracked, and default behaviour is just to 
+merge bags, adding missing elements on node they are not present. 
 
-For each table and for each key in table it checks if corresponding
-values are present and equal on both nodes. If so, then it just movies to 
-next key/next table, but if not...
+With Data Collision, when elements are present on both nodes with different
+content, conflict resolution function is called. Default behaviour for 
+`set` tables is to do nothing but to raise alarm (using `sasl` `alarm_handler`),
+and for `bag` tables both elements are written on both nodes.
 
-For `set`'s and `ordered_set`'s: 
-- if we have an object on local node and do not have on remote: 
-we are checking if there is a corresponding 'inserted' change on our node. 
-If so, this difference was caused by local insert, and we push our object to 
-remote node. Otherwise, this difference was caused by remote delete while 
-partition, and so the local object can be removed.
-- on the other hand, if there is no corresponding object on local node, but
-there is one on remote: we checking, if there were corresponding 'delete'
-change here. If so, object is deleted remotely, elsewhere remote object
-is copied locally. 
-- well, the most interesting thing happens when there are corresponding
-objects on both nodes, but they are not equal, aka 'conflicting'. 
-Of course, `reunion` have absolutely no idea on which object is better and
-should be stored and which is worse and should be eliminated, so with the
-default `merge_only` strategy it can't do nothing better than raise 
-system alarm about this conflict. Different strategies are possible, 
-there are two predefined ones: `last_modified` (which compares `modified`
-attribute of your objects) and more generic `last_version`, which can 
-compare any attribute. To configure use of a non-default strategy 
-you should set `reunion_compare` attribute of this table to {M, F, A}:
+There are two more pre-defined strategies: `last_version`, that selects
+"best" record using comparision on some field in the record, 
 
 	(node@host)>mnesia:write_table_property(kvs, {reunion_compare, 
-		{reunion_lib, last_version, [value]}}).
+		{reunion_lib, last_version, [field]}}).
 
-or
+and `last_modified` (variant of last_version using pre-defined `modified` field
+for comparison):
 
 	(node@host)>mnesia:write_table_property(kvs, {reunion_compare, 
 		{reunion_lib, last_modified, []}}).
 
-Of course, you are not limited to predefined strategies, and you can 
-provide yours. Your resolution function must be arity-3 function and 
-be ready to be called with: 
+These strategies can be used for `bag` tables too, but configuration is a bit
+different: to select "best" element among a bag, elements should have some
+"secondary key" field, and "best" element is selected only among elements with
+the same "secondary key".
 
-	function(init, {Table :: atom(), set | bag, Attributes :: list(atom()), 
-		XAttributes :: list(any())}, Remote :: atom()) -> 
+You can define your own conflict resolution functon, which will be called as:
+
+	function(init, {Table :: atom(), Type :: 'set' | 'bag', Fields :: list(atom()), 
+		RemoteNode :: atom()) -> 
 		{ok, Modstate :: any()};
-	function(done, Modstate, Remote :: atom()) -> 
+	function(done, Modstate :: any(), RemoteNode :: atom()) -> 
 		any();
-	function(LocalObject :: any(), RemoteObject :: any(), Modstate :: any()) -> 
-		{ok, Actions :: list(action()), NextState} | 
-		{ok, left, NextState}    | 
-		{ok, right, NextState}   | 
-		{inconsistency, Error, NextState}
-		when Action :: {write_local, Object} | 
-			{write_remote, Object} | 
-			{delete_local, Object} | 
-			{delete_remote, Object}.
+	function(LocalRecords, RemoteRecord, ModState :: any()) -> 
+		{ok, Actions :: reunion:action() | list(reunion:action()), 
+			NextState :: any()} | 
+		{inconsistency, Error, NextState :: any()}
+		
+where `Action` can be one of 
 
-i hope the names are self-descriptive enough :)
+	{write_local, Record} | {write_remote, Record} | {delete_local, Record} | 
+		{delete_remote, Record}
 
-For bag tables default behaviour is about the same. Major difference: bag keys are 
-not tracked, so there is no easy way to decide if missing object was removed, so 
-it's left to conflict resolution funcions. Default `merge_only` function makes no 
-assumptions and just adds missing objects to bags. 
-
-Also there are `last_version` and `last_modified` strategies predefined for bags too, 
-but those require your objects to have some `secondary index` field, unique for objects 
-with the same key, and comparison over `version`/`modified` field is done for objects
-with the same `secondary key`. Of course, this means that you shall mention name of 
-this secondary key as a second parameter in initialization:
-
-	(node@host)>mnesia:write_table_property(bag, {reunion_compare, 
-		{reunion_lib, last_version, [modified,value]}}).
+i hope, the names are self-descriptive enough.
 
 Excluding table from automatic merging:
 ---------------------------------------
