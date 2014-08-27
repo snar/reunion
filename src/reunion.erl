@@ -8,7 +8,6 @@
 
 -define(TABLE, ?MODULE).
 -define(DEQUEUE_TIMEOUT, 1000).
--define(PING_TIMEOUT, 30000).
 -define(EXPIRE_TIMEOUT, case net_kernel:get_net_ticktime() of 
 	ignored -> 60+1; 
 	{ongoing_change_to, Tick} -> Tick+1;
@@ -34,12 +33,16 @@ end). % seconds
 	modstate}).
 
 start_link() -> 
-	gen_server:start_link({local, ?MODULE}, ?MODULE, [[]], []).
+	case wait_mnesia(10) of 
+		ok -> 
+			gen_server:start_link({local, ?MODULE}, ?MODULE, [[]], []);
+		_ -> 
+			{error, {mnesia, not_running}}
+	end.
 
 init(_Args) -> 
-	Node = node(),
-	{ok, Node} = mnesia:subscribe(system),
-	{ok, Node} = mnesia:subscribe({table, schema, detailed}),
+	{ok, _} = mnesia:subscribe(system),
+	{ok, _} = mnesia:subscribe({table, schema, detailed}),
 	Db = ets:new(?TABLE, [set, named_table]),
 	Tables = lists:foldl(fun
 		(schema, Acc) -> Acc;
@@ -47,7 +50,8 @@ init(_Args) ->
 			Attrs = mnesia:table_info(T, all),
 			case should_track(T, Attrs) of 
 				true -> 
-					mnesia:subscribe({table, T, detailed}),
+					ok = mnesia:wait_for_tables([T], 100),
+					{ok,_} = mnesia:subscribe({table, T, detailed}),
 					sets:add_element(T, Acc);
 				false -> 
 					error_logger:info_msg("~p (init): NOT tracking table ~p~n",
@@ -58,7 +62,10 @@ init(_Args) ->
 	Mode = case mnesia:system_info(db_nodes) -- mnesia:system_info(running_db_nodes) of 
 		[] -> queue;
 		_  -> 
-			self() ! {timeout, undefined, ping},
+			case application:get_env(reunion, reconnect) of 
+				{ok, never} -> ok;
+				_ -> self() ! {timeout, undefined, ping}
+			end,
 			store
 	end,
 	error_logger:info_msg("~p (init): starting in ~p mode, tracking ~p~n", 
@@ -81,9 +88,12 @@ handle_info({mnesia_table_event, {write, schema, {schema, Table, Attrs}, _,
 		{true, true} -> 
 			{noreply, State};
 		{true, false} -> 
-			ok = mnesia:wait_for_tables([Table], 1000),
+			Pre = os:timestamp(),
+			ok = mnesia:wait_for_tables([Table], 100),
+			Post = os:timestamp(),
 			{ok, _} = mnesia:subscribe({table, Table, detailed}),
-			error_logger:info_msg("~p: starting tracking ~p", [?MODULE, Table]),
+			error_logger:info_msg("~p: started tracking ~p, elapsed: ~p micros", 
+				[?MODULE, Table, timer:now_diff(Post, Pre)]),
 			Ns = sets:add_element(Table, State#state.tables),
 			{noreply, State#state{tables=Ns}};
 		{false, true} -> 
@@ -177,6 +187,9 @@ handle_info({mnesia_table_event, {delete, Table, Record, _Old, _ActId}},
 			State#state.queue
 	end,
 	{noreply, State#state{queue=Nq}};
+handle_info({mnesia_system_event, {mnesia_up, Node}}, State) when Node == node() -> 
+	error_logger:info_msg("reunion: got mnesia_up for local node ~p, ignore", [node()]),
+	{noreply, State};
 handle_info({mnesia_system_event, {mnesia_up, Node}}, State) when 
 	State#state.mode == store -> 
 	{Mode, Nq} = case nextmode() of 
@@ -211,7 +224,7 @@ handle_info({mnesia_system_event, {mnesia_down, Node}}, State) when
 		[?MODULE, Node]),
 	% mirror all queued entries to ets
 	queue_mirror(State#state.queue),
-	Ping = erlang:start_timer(?PING_TIMEOUT, ?MODULE, ping),
+	Ping = schedule_ping(),
 	{noreply, State#state{mode=store, pingtimer=Ping}};
 handle_info({mnesia_system_event, {inconsistent_database, running_partitioned_network, 
 	Node}}, State) -> 
@@ -253,16 +266,23 @@ handle_info({timeout, Ref, ping}, #state{pingtimer=Ref} = State) ->
 			spawn(fun() -> 
 				lists:foreach(fun(N) -> net_adm:ping(N) end, List) 
 			end),
-			Ping = erlang:start_timer(?PING_TIMEOUT, ?MODULE, ping),
+			Ping = schedule_ping(),
 			{noreply, State#state{pingtimer=Ping}}
 	end;
 handle_info(ping, State) -> 
 	case mnesia:system_info(db_nodes) -- mnesia:system_info(running_db_nodes) of 
 		[] -> 
-			{noreply, State};
+			ok;
 		List -> 
 			spawn(fun() -> 
 				lists:foreach(fun(N) -> net_adm:ping(N) end, List) end),
+			ok
+	end,
+	case State#state.pingtimer of 
+		undefined -> 
+			% will not setup timer if reconnect set to never
+			{noreply, State#state{pingtimer=schedule_ping()}};
+		_ -> 
 			{noreply, State}
 	end;
 handle_info({timeout, Ref, expire}, #state{exptimer=Ref} = State) -> 
@@ -285,6 +305,12 @@ terminate(Reason, _State) ->
 
 code_change(_Old, State, _Extra) -> 
 	{ok, State}.
+
+schedule_ping() -> 
+	case application:get_env(?MODULE, reconnect, ?EXPIRE_TIMEOUT) of 
+		never -> undefined;
+		Time  -> erlang:start_timer(Time*1000000, ?MODULE, ping)
+	end.
 
 should_track(_T, Attr) -> 
 	LocalContent = proplists:get_value(local_content, Attr),
@@ -381,8 +407,6 @@ do_stitch_together(Node) ->
 			Answer
 	end,
 	TabsAndNodes = affected_tables(IslandB),
-	error_logger:info_msg("tabs and nodes: ~p, my tables: ~p", [TabsAndNodes,
-		mnesia:system_info(tables) -- [schema]]),
 	Tables = [ T || {T, _} <- TabsAndNodes ],
 	DefaultMethod = default_method(),
 	TabMethods = [{T, Ns, get_method(T, DefaultMethod)} || 
@@ -428,7 +452,7 @@ run_stitch(#s0{module=M, function=F, table=Tab, remote=Remote, type=Type,
 	% usort used to remove duplicates
 	Keys = lists:usort(lists:concat([LocalKeys, remote_keys(Remote, Tab)])),
 	lists:foldl(fun(K, Sx) -> 
-		A = mnesia:read({Tab, K}),
+		A = mnesia:dirty_read({Tab, K}),
 		B = remote_object(Remote, Tab, K), 
 		case {A, B} of 
 			{[], []} -> 
@@ -442,18 +466,21 @@ run_stitch(#s0{module=M, function=F, table=Tab, remote=Remote, type=Type,
 				% remote element is not present
 				case is_locally_inserted(Tab, K) of 
 					{true, LocalTime} -> 
-						case rpc:call(Remote, reunion, is_locally_removed, [Tab, K]) of 
+						case rpc:call(Remote, reunion, is_locally_removed, 
+							[Tab, K]) of 
 							false ->
-								?debug("reunion(stitch ~p ~p ~p ~p): write remote "
-									"(not removed)~n", 
+								?debug("reunion(stitch ~p ~p ~p ~p): write "
+									"remote (not removed)~n", 
 									[Tab, Type, A, B]),
 								write(Remote, Aa);
 							{true, RemoteTime} when LocalTime < RemoteTime -> 
-								?debug("reunion(stitch ~p ~p ~p ~p): delete local~n", 
+								?debug("reunion(stitch ~p ~p ~p ~p): delete "
+									"local (remote timer won)~n", 
 									[Tab, Type, A, B]),
 								delete(Aa);
 							_ ->  % can be an error too
-								?debug("reunion(stitch ~p ~p ~p ~p): write remote~n", 
+								?debug("reunion(stitch ~p ~p ~p ~p): write "
+									"remote (error or timer)~n", 
 									[Tab, Type, A, B]),
 								write(Remote, Aa)
 						end;
@@ -467,17 +494,21 @@ run_stitch(#s0{module=M, function=F, table=Tab, remote=Remote, type=Type,
 				% local element not present
 				case is_locally_removed(Tab, K) of 
 					{true, LocalTime} -> 
-						case rpc:call(Remote, ?MODULE, is_locally_inserted, [Tab, K]) of 
+						case rpc:call(Remote, ?MODULE, is_locally_inserted, 
+							[Tab, K]) of 
 							false -> 
-								?debug("reunion(stitch ~p ~p ~p ~p): delete remote~n", 
+								?debug("reunion(stitch ~p ~p ~p ~p): delete "
+									"remote (not remotely inserted)~n", 
 									[Tab, Type, A, B]),
 								delete(Remote, Bb);
 							{true, RemoteTime} when LocalTime < RemoteTime -> 
-								?debug("reunion(stitch ~p ~p ~p ~p): write local~n", 
+								?debug("reunion(stitch ~p ~p ~p ~p): write "
+									"local (remote timer won)~n", 
 									[Tab, Type, A, B]),
 								write(Bb);
 							_ -> 
-								?debug("reunion(stitch ~p ~p ~p ~p): delete remote~n", 
+								?debug("reunion(stitch ~p ~p ~p ~p): delete "
+									"remote (error or timer)~n", 
 									[Tab, Type, A, B]),
 								delete(Remote, Bb)
 						end;
@@ -487,40 +518,17 @@ run_stitch(#s0{module=M, function=F, table=Tab, remote=Remote, type=Type,
 						write(Bb)
 				end,
 				Sx;
-			{[Aa], [Bb]} when Type == set -> 
-				Sn = case M:F(Aa, Bb, Sx) of 
-					{ok, left, Sr} -> 
-						?debug("reunion(stitch ~p ~p ~p ~p): left, write remote~n", 
-							[Tab, Type, A, B]),
-						write(Remote, Aa), 
-						Sr;
-					{ok, right, Sr} -> 
-						?debug("reunion(stitch ~p ~p ~p ~p): right, write local~n", 
-							[Tab, Type, A, B]),
-						write(Bb), Sr;
-					{ok, both, Sr} when Type == bag -> 
-						?debug("reunion(stitch ~p ~p ~p ~p): both, write both~n", 
-							[Tab, Type, A, B]),
-						write(Bb),
-						write(Remote, Aa), 
-						Sr;
-					{ok, neither, Sr} -> 
-						?debug("reunion(stitch ~p ~p ~p ~p): neither, delete both~n", 
-							[Tab, Type, A, B]),
-						delete(Aa),
-						delete(Remote, Bb), 
+			{A, B} -> 
+				Sn = case M:F(A, B, Sx) of 
+					{ok, Actions, Sr} -> 
+						?debug("reunion(stitch ~p ~p ~p ~p): ~p"
+							"both~n", [Tab, Type, A, B]),
+						do_actions(Actions, Remote),
 						Sr;
 					{inconsistency, Error, Sr} -> 
-						?debug("reunion(stitch ~p ~p ~p ~p): inconsistency ~p~n", 
-							[Tab, Type, A, B, Error]),
+						?debug("reunion(stitch ~p ~p ~p ~p): inconsistency "
+							"~p~n", [Tab, Type, A, B, Error]),
 						report_inconsistency(Remote, Tab, K, Error),
-						Sr
-				end,
-				Sn;
-			{[Aa], [Bb]} when Type == bag -> 
-				Sn = case M:F(Aa, Bb, Sx) of 
-					{ok, Actions, Sr} -> 
-						do_actions(Actions, Remote),
 						Sr
 				end,
 				Sn
@@ -533,12 +541,20 @@ do_actions([], _) ->
 	ok;
 do_actions([{write_local, Ae}|Next], Remote) -> 
 	write(Ae), do_actions(Next, Remote);
+do_actions({write_local, Ae}, _Remote) -> 
+	write(Ae);
 do_actions([{delete_local, Ae}|Next], Remote) -> 
 	delete(Ae), do_actions(Next, Remote);
+do_actions({delete_local, Ae}, _Remote) -> 
+	delete(Ae);
 do_actions([{write_remote, Ae}|Next], Remote) -> 
 	write(Remote, Ae), do_actions(Next, Remote);
+do_actions({write_remote, Ae}, Remote) -> 
+	write(Remote, Ae); 
 do_actions([{delete_remote, Ae}|Next], Remote) -> 
-	delete(Remote, Ae), do_actions(Next, Remote).
+	delete(Remote, Ae), do_actions(Next, Remote);
+do_actions({delete_remote, Ae}, Remote) -> 
+	delete(Remote, Ae).
 
 affected_tables(IslandB) -> 
 	IslandA = mnesia:system_info(running_db_nodes),
@@ -570,8 +586,8 @@ delete(A) ->
 remote_keys(Remote, Tab) -> 
 	case rpc:call(Remote, mnesia, dirty_all_keys, [Tab]) of 
 		{badrpc, Reason} -> 
-			error_logger:error_msg("?p: error querying dirty_all_keys(~p) on ~p:~n  ~p",
-				[?MODULE, Tab, Remote, Reason]),
+			error_logger:error_msg("?p: error querying dirty_all_keys(~p) "
+				"on ~p:~n  ~p", [?MODULE, Tab, Remote, Reason]),
 			mnesia:abort({badrpc, Remote, Reason});
 		Keys -> Keys
 	end.
@@ -588,26 +604,32 @@ remote_object(Remote, Tab, Key) ->
 is_locally_inserted(Tab, Key) -> 
 	case ets:lookup(?TABLE, {Tab, Key}) of 
 		[] -> 
-			?debug("reunion(is_locally_inserted): {~p, ~p} not in ets~n", [Tab, Key]),
+			?debug("reunion(is_locally_inserted): {~p, ~p} not in ets~n", 
+				[Tab, Key]),
 			false;
 		[{{Tab, Key}, 'insert', T}] -> 
-			?debug("reunion(is_locally_inserted): {~p, ~p} was inserted~n", [Tab, Key]),
+			?debug("reunion(is_locally_inserted): {~p, ~p} was inserted~n", 
+				[Tab, Key]),
 			{true, T};
 		[{{Tab, Key}, 'delete', _}] -> 
-			?debug("reunion(is_locally_inserted): {~p, ~p} was deleted~n", [Tab, Key]),
+			?debug("reunion(is_locally_inserted): {~p, ~p} was deleted~n", 
+				[Tab, Key]),
 			false
 	end.
 
 is_locally_removed(Tab, Key) -> 
 	case ets:lookup(?TABLE, {Tab, Key}) of 
 		[] -> 
-			?debug("reunion(is_locally_removed): {~p, ~p} not in ets~n", [Tab, Key]),
+			?debug("reunion(is_locally_removed): {~p, ~p} not in ets~n", 
+				[Tab, Key]),
 			false;
 		[{{Tab, Key}, 'insert', _}] -> 
-			?debug("reunion(is_locally_removed): {~p, ~p} was inserted~n", [Tab, Key]),
+			?debug("reunion(is_locally_removed): {~p, ~p} was inserted~n", 
+				[Tab, Key]),
 			false;
 		[{{Tab, Key}, 'delete', T}] -> 
-			?debug("reunion(is_locally_removed): {~p, ~p} was deleted~n", [Tab, Key]),
+			?debug("reunion(is_locally_removed): {~p, ~p} was deleted~n", 
+				[Tab, Key]),
 			{true, T}
 	end.
 
@@ -619,15 +641,16 @@ check_inconsistencies() ->
 				case {mnesia:dirty_read(Tab, Key), 
 					rpc:call(Remote, mnesia, dirty_read, [Tab, Key])} of 
 					{A, A} -> 
-						alarm_handler:clear_alarm({?MODULE, inconsistency, Remote, 
-							Tab, Key});
+						alarm_handler:clear_alarm({?MODULE, inconsistency, 
+							Remote, Tab, Key});
 					_ -> ok
 				end
 		end;
 		(_) -> ok end, alarm_handler:get_alarms()).
 
 report_inconsistency(Remote, Tab, Key, Error) -> 
-	alarm_handler:set_alarm({{?MODULE, inconsistency, Remote, Tab, Key}, Error}).
+	alarm_handler:set_alarm({{?MODULE, inconsistency, Remote, Tab, Key}, 
+		Error}).
 
 default_method() -> 
 	get_env(default_method, ?DEFAULT_METHOD).
@@ -648,3 +671,16 @@ get_env(Env, Default) ->
 	end.
 
 intersection(A, B) -> A -- (A -- B).
+
+wait_mnesia(N) -> 
+	case mnesia:system_info(is_running) of 
+		yes -> ok;
+		_ -> 
+			case N > 0 of 
+				true -> 
+					timer:sleep(100),
+					wait_mnesia(N-1);
+				false -> 
+					{error, not_running}
+			end
+	end.
