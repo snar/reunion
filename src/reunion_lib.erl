@@ -8,14 +8,13 @@
 		ok;
 	(any(), any(), atom()) -> 
 		{ok, list(reunion:action()), atom()} | 
-		{ok, left, atom()} | 
-		{ok, right, atom()} | 
+		{ok, reunion:action(), atom()} | 
 		{inconsistency, any(), atom()}.
 
 merge_only(init, {_,set,_,_}, _) -> {ok, set};
 merge_only(init, {_,bag,_,_}, _) -> {ok, bag};
 merge_only(done, _, _) -> ok;
-merge_only(A, B, set) -> 
+merge_only([A], [B], set) -> 
 	{inconsistency, {merge, A, B}, set};
 merge_only(A, B, bag) when is_list(A), is_list(B) -> 
 	{Aonly, Bonly} = merge_bags(A, B),
@@ -29,8 +28,7 @@ merge_only(A, B, bag) when is_list(A), is_list(B) ->
 		ok;
 	(any(), any(), atom()) -> 
 		{ok, list(reunion:action()), atom()} | 
-		{ok, left, atom()} | 
-		{ok, right, atom()} | 
+		{ok, reunion:action(), atom()} | 
 		{inconsistency, any(), atom()}.
 
 last_modified(init, {Table, Type, Attrs, Xargs}, Node) -> 
@@ -45,8 +43,7 @@ last_modified(A, B, C) ->
 		ok;
 	(any(), any(), atom()) -> 
 		{ok, list(reunion:action()), atom()} | 
-		{ok, left, atom()} | 
-		{ok, right, atom()} | 
+		{ok, reunion:action(), atom()} | 
 		{inconsistency, any(), atom()}.
 
 last_version(init, {Table, set, Attrs, [VField|_]}, _Node) -> 
@@ -55,10 +52,10 @@ last_version(init, {Table, bag, Attrs, [VField, IField|_]}, _Node) ->
 	{ok, {bag, pos(VField, Table, Attrs), pos(IField, Table, Attrs)}};
 last_version(done, _State, _Node) -> 
 	ok;
-last_version(A, B, {set, Field} = Ms) when is_tuple(A), is_tuple(B) -> 
+last_version([A], [B], {set, Field} = Ms) when is_tuple(A), is_tuple(B) -> 
 	case element(Field, A) >= element(Field, B) of 
-		true -> {ok, left, Ms};
-		false -> {ok, right, Ms}
+		true -> {ok, {write_remote, A}, Ms};
+		false -> {ok, {write_local, B}, Ms}
 	end;
 last_version(A, B, {bag, Vfield, Ifield} = State) -> 
 	Actions = merge_versioned(A, B, Vfield, Ifield, []),
