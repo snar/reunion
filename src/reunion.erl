@@ -215,21 +215,23 @@ handle_info({mnesia_system_event, {mnesia_up, Node}}, State) when
 	error_logger:info_msg("~p: got mnesia_up ~p in store mode, next mode: ~p", 
 		[?MODULE, Node, Mode]),
 	{noreply, State#state{mode=Mode, queue=Nq}};
-handle_info({mnesia_system_event, {mnesia_down, Node}}, State) when node() == Node -> 
-	error_logger:info_msg("~p: got mnesia_down for local node, stop", [?MODULE]),
+handle_info({mnesia_system_event, {mnesia_down, Node}}, State) when 
+	node() == Node -> 
+	error_logger:info_msg("~p: got mnesia_down for local node, stop", 
+		[?MODULE]),
 	{stop, normal, State};
 handle_info({mnesia_system_event, {mnesia_down, Node}}, State) when 
 	State#state.mode == queue -> 
-	error_logger:info_msg("~p: got mnesia_down ~p in queue mode, switching to store", 
-		[?MODULE, Node]),
 	% mirror all queued entries to ets
 	queue_mirror(State#state.queue),
 	Ping = schedule_ping(),
+	error_logger:info_msg("~p: got mnesia_down ~p in queue mode, switching "
+		"to store, timer: ~p", [?MODULE, Node, Ping]),
 	{noreply, State#state{mode=store, pingtimer=Ping}};
-handle_info({mnesia_system_event, {inconsistent_database, running_partitioned_network, 
-	Node}}, State) -> 
-	error_logger:info_msg("~p: Inconsistency (running_partitioned_network) with ~p~n",
-		[?MODULE, Node]),
+handle_info({mnesia_system_event, {inconsistent_database, 
+	running_partitioned_network, Node}}, State) -> 
+	error_logger:info_msg("~p: Inconsistency (running_partitioned_network) "
+		"with ~p~n", [?MODULE, Node]),
 	case application:get_env(?MODULE, delay, 0) of 
 		0 -> ok;
 		Value -> 
@@ -247,14 +249,15 @@ handle_info({mnesia_system_event, {inconsistent_database, running_partitioned_ne
 					process_info(self(), messages)]),
 			stitch_together(Node)
 		end),
-	error_logger:info_msg("~p: stitching with ~p: ~p", [?MODULE, Node, Res]),
 	{noreply, State};
-handle_info({mnesia_system_event, {inconsistent_database, starting_partitioned_network, 
-	Node}}, State) -> 
+handle_info({mnesia_system_event, {inconsistent_database, 
+	starting_partitioned_network, Node}}, State) -> 
 	% this is recovery message sent after merge.
-	error_logger:info_msg("~p: starting_partitioned_network with ~p", [?MODULE, Node]),
+	error_logger:info_msg("~p: starting_partitioned_network with ~p", 
+		[?MODULE, Node]),
 	{noreply, State};
-handle_info({mnesia_system_event, {inconsistent_database, Context, Node}}, State) -> 
+handle_info({mnesia_system_event, {inconsistent_database, Context, Node}}, 
+	State) -> 
 	error_logger:info_msg("~p: mnesia inconsistent_database in ~p with ~p",
 		[?MODULE, Context, Node]),
 	{noreply, State};
@@ -270,7 +273,7 @@ handle_info({timeout, Ref, ping}, #state{pingtimer=Ref} = State) ->
 			{noreply, State#state{pingtimer=Ping}}
 	end;
 handle_info(ping, State) -> 
-	case mnesia:system_info(db_nodes) -- mnesia:system_info(running_db_nodes) of 
+	case mnesia:system_info(db_nodes) -- mnesia:system_info(running_db_nodes) of
 		[] -> 
 			ok;
 		List -> 
@@ -309,7 +312,7 @@ code_change(_Old, State, _Extra) ->
 schedule_ping() -> 
 	case application:get_env(?MODULE, reconnect, ?EXPIRE_TIMEOUT) of 
 		never -> undefined;
-		Time  -> erlang:start_timer(Time*1000000, ?MODULE, ping)
+		Time  -> erlang:start_timer(Time*1000, ?MODULE, ping)
 	end.
 
 should_track(_T, Attr) -> 
@@ -363,7 +366,7 @@ unqueue(Queue, Table) ->
 		end, Queue).
 
 nextmode() -> 
-	case mnesia:system_info(db_nodes) -- mnesia:system_info(running_db_nodes) of 
+	case mnesia:system_info(db_nodes) -- mnesia:system_info(running_db_nodes) of
 		[] -> queue;
 		_  -> store
 	end.
@@ -380,8 +383,8 @@ queue_mirror(Queue) ->
 stitch_together(Node) -> 
 	case lists:member(Node, mnesia:system_info(running_db_nodes)) of 
 		true -> 
-			error_logger:info_msg("~p: node ~p already running, not stitching~n", 
-				[?MODULE, Node]),
+			error_logger:info_msg("~p: node ~p already running, "
+				"not stitching~n", [?MODULE, Node]),
 			ok;
 		false -> 
 			pre_stitch_together(Node)
@@ -422,8 +425,8 @@ do_stitch_together(Node) ->
 					stitch_tabs(TabMethods, Node),
 					Res;
 				Other -> 
-					error_logger:info_msg("~p: MergeF ret = ~p (nonstitch) in ~p", 
-						[?MODULE, Other, self()]),
+					error_logger:info_msg("~p: MergeF ret = ~p (nonstitch) "
+						"in ~p", [?MODULE, Other, self()]),
 					Other
 			end
 		end).
@@ -443,7 +446,8 @@ do_stitch({Tab, _Nodes, {M, F, Xargs}}, Node) ->
 		throw:?DONE -> ok
 	end;
 do_stitch({Tab, _Nodes, ignore}, _Node) -> 
-	error_logger:info_msg("~p: ignoring table ~p (configuration)", [Tab]),
+	error_logger:info_msg("~p: ignoring table ~p (configuration)", 
+		[?MODULE, Tab]),
 	ok.
 
 run_stitch(#s0{module=M, function=F, table=Tab, remote=Remote, type=Type,
