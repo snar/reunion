@@ -19,16 +19,16 @@ Advanced usage:
 ---------------
 
 `reunion` tries to detect two types of collisions: 
-- INSERT/DELETE collision, when some record is present on one node and not present 
-on another.
+- INSERT/DELETE collision, when some record is present on one node and 
+not present on another.
 - Data Collision, when some record present on both nodes but contents differ.
 
 In order to resolve first type of collision for `set` tables, `reunion` tracks
-insert and delete operations, storing info about Table, Key, Operation and WhenItHappened
-in internal `ets` table. When collision occurs, `reunion` consults this table
-trying to determine last event for this key and restores record accordingly
-(if last found event is 'insert' - record is re-inserted on node it missed,
-if 'delete' - record is deleted on node it still present).
+insert and delete operations, storing info about Table, Key, Operation and 
+WhenItHappened in internal `ets` table. When collision occurs, `reunion` 
+consults this table trying to determine last event for this key and restores 
+record accordingly (if last found event is 'insert' - record is re-inserted 
+on node it missed, if 'delete' - record is deleted on node it still present).
 
 For `bag` tables operations are not tracked, and default behaviour is just to 
 merge bags, adding missing elements on node they are not present. 
@@ -72,12 +72,20 @@ where `Action` can be one of
 	{write_local, Record} | {write_remote, Record} | {delete_local, Record} | 
 		{delete_remote, Record}
 
-i hope, the names are self-descriptive enough.
+I hope, the names are self-descriptive enough.
 
 Excluding table from automatic merging:
 ---------------------------------------
 
 	(node@host)>mnesia:write_table_property(bag, {reunion_compare, ignore}).
+
+Disabling automatic reconnects: 
+-------------------------------
+	
+	(node@host)>application:set_env(reunion, reconnect, never).
+
+With this setting no new reconnect timers will be scheduled. If you want
+to 
 
 Known problems: 
 ---------------
