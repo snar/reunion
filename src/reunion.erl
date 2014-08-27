@@ -238,7 +238,7 @@ handle_info({mnesia_system_event, {inconsistent_database,
 			?debug("reunion: sleeping ~p before acquiring lock", [Value]),
 			timer:sleep(Value)
 	end,
-	Res = global:trans({?LOCK, self()}, 
+	global:trans({?LOCK, self()}, 
 		fun() -> 
 			?debug("~p: have global lock. mnesia locks: ~p", 
 				[?MODULE, mnesia_locker:get_held_locks()]),
@@ -318,10 +318,17 @@ schedule_ping() ->
 should_track(_T, Attr) -> 
 	LocalContent = proplists:get_value(local_content, Attr),
 	Type = proplists:get_value(type, Attr),
-	AllNodes = proplists:get_value(all_nodes, Attr),
+	AllNodes = proplists:get_value(disc_copies, Attr, []) ++ 
+		proplists:get_value(ram_copies, Attr, []) ++
+		proplists:get_value(disc_only_copies, Attr, []),
+	Member   = lists:member(node(), AllNodes),
 	if 
 		LocalContent == true -> 
 			?debug("reunion: should not track ~p: local_content only~n", [_T]),
+			false;
+		Member == false -> 
+			?debug("reunion: should not track ~p: this node does not have "
+				"a copy", [_T]),
 			false;
 		Type == bag ->  % sets and ordered_sets are ok
 			?debug("reunion: should not track ~p: bag~n", [_T]),
