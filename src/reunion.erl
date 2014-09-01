@@ -62,7 +62,7 @@ init(_Args) ->
 									Acc;
 								{error, Other} ->
 									error_logger:info_msg("?p: unable to "
-										"subscribe ~p: ~p", [?MODULE, Table,
+										"subscribe ~p: ~p", [?MODULE, T,
 										Other]),
 									erlang:start_timer(?RESUBSCRIBE_TIMEOUT,
 										self(), {subscribe, T}),
@@ -392,9 +392,9 @@ schedule_ping() ->
 should_track(T) ->
 	try mnesia:table_info(T, all) of
 		Attrs ->
-			should_track(T, all)
+			should_track(T, Attrs)
 	catch
-		Error:Code ->
+		_Error:_Code ->
 			false
 	end.
 
