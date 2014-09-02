@@ -45,44 +45,24 @@ init(_Args) ->
 	{ok, _} = mnesia:subscribe(system),
 	{ok, _} = mnesia:subscribe({table, schema, detailed}),
 	Db = ets:new(?TABLE, [set, named_table]),
-	Tables = lists:foldl(fun
-		(schema, Acc) -> Acc;
+	State = lists:foldl(fun
+		(schema, Acc) ->
+			Acc;
 		(T, Acc) ->
 			Attrs = mnesia:table_info(T, all),
-			case should_track(T, Attrs) of
-				true ->
-					case mnesia:wait_for_tables([T], 5000) of
-						ok ->
-							case mnesia:subscribe({table, T, detailed}) of
-								{ok, _} ->
-									sets:add_element(T, Acc);
-								{error, {not_active_local, T}} ->
-									erlang:start_timer(?RESUBSCRIBE_TIMEOUT,
-										?MODULE, {subscribe, T}),
-									Acc;
-								{error, Other} ->
-									error_logger:info_msg("?p: unable to "
-										"subscribe ~p: ~p", [?MODULE, T,
-										Other]),
-									erlang:start_timer(?RESUBSCRIBE_TIMEOUT,
-										self(), {subscribe, T}),
-									Acc
-							end;
-						{timeout, [T]} ->
-							error_logger:info_msg("~p: timeout waiting for ~p, "
-								"mnesia running: ~p",
-								[?MODULE, T, mnesia:system_info(is_running)]),
-							erlang:start_timer(?RESUBSCRIBE_TIMEOUT, self(),
-								{subscribe, T}),
-							Acc
-					end;
-				false ->
-					error_logger:info_msg("~p (init): NOT tracking table ~p~n",
-						[?MODULE, T]),
+			case {should_track(T, Attrs), sets:is_element(T, Acc#state.tables)}
+				of
+				{true, true} ->
+					% this table is already tracked, most likely fragment
+					Acc;
+				{true, _} ->
+					track_table(T, Acc);
+				{false, false} ->
 					Acc
 			end
-		end, sets:new(), mnesia:system_info(tables)),
-	Mode = case mnesia:system_info(db_nodes) -- mnesia:system_info(running_db_nodes) of
+		end, #state{tables=sets:new()}, mnesia:system_info(tables)),
+	Mode = case mnesia:system_info(db_nodes) --
+		mnesia:system_info(running_db_nodes) of
 		[] -> queue;
 		_  ->
 			case application:get_env(reunion, reconnect) of
@@ -92,9 +72,9 @@ init(_Args) ->
 			store
 	end,
 	error_logger:info_msg("~p (init): starting in ~p mode, tracking ~p~n",
-		[?MODULE, Mode, sets:to_list(Tables)]),
+		[?MODULE, Mode, sets:to_list(State#state.tables)]),
 	Expire = erlang:start_timer(?DEQUEUE_TIMEOUT, ?MODULE, expire),
-	{ok, #state{db=Db, mode=Mode, queue=queue:new(), tables=Tables, exptimer=Expire}}.
+	{ok, State#state{db=Db, mode=Mode, queue=queue:new(), exptimer=Expire}}.
 
 handle_call(_Any, _From, State) ->
 	{reply, {error, badcall}, State}.
@@ -110,64 +90,24 @@ handle_info({mnesia_table_event, {write, schema, {schema, Table, Attrs}, _,
 	case {should_track(Table, Attrs),
 		sets:is_element(Table, State#state.tables)} of
 		{true, true} ->
+			?debug("reunion(write, schema): ~p is already tracked", [Table]),
 			{noreply, State};
 		{true, false} ->
-			Pre = os:timestamp(),
-			case mnesia:wait_for_tables([Table], ?WAIT_TIMEOUT) of
-				ok ->
-					Post = os:timestamp(),
-					case mnesia:subscribe({table, Table, detailed}) of
-						{ok, _} ->
-							error_logger:info_msg("~p: started tracking ~p, "
-								"elapsed:  ~p micros", [?MODULE, Table,
-								timer:now_diff(Post, Pre)]),
-							Ns = sets:add_element(Table, State#state.tables),
-							{noreply, State#state{tables=Ns}};
-						{error, {not_active_local, Table}} ->
-							erlang:start_timer(?RESUBSCRIBE_TIMEOUT, self(),
-								{subscribe, Table}),
-							{noreply, State};
-						{error, Other} ->
-							error_logger:info_msg("~p: unable to subscribe to "
-								"~p: ~p", [?MODULE, Table, Other]),
-							erlang:start_timer(?RESUBSCRIBE_TIMEOUT, self(),
-								{subscribe, Table}),
-							{noreply, State}
-					end;
-				{timeout, [Table]} ->
-					erlang:start_timer(?RESUBSCRIBE_TIMEOUT, ?MODULE,
-						{subscribe, Table}),
-					{noreply, State}
-			end;
+			?debug("reunion(write, schema): calling track_table(~p)", [Table]),
+			{noreply, track_table(Table, State)};
 		{false, true} ->
-			error_logger:info_msg("~p: stop tracking ~p", [?MODULE, Table]),
-			Nq = case State#state.mode of
-				queue ->
-					unqueue(State#state.queue, Table);
-				store ->
-					ets:match_delete(?TABLE, {{Table, '_'}, '_', '_'}),
-					State#state.queue
-			end,
-			Ns = sets:del_element(Table, State#state.tables),
-			{noreply, State#state{queue=Nq, tables=Ns}};
+			?debug("reunion(write, schema): calling untrack_table(~p)", 
+				[Table]),
+			{noreply, untrack_table(Table, State)};
 		{false, false} ->
+			?debug("reunion(write, schema): ~p is not tracked", [Table]),
 			{noreply, State}
 	end;
 handle_info({mnesia_table_event, {delete, schema, {schema, Table, _Attrs}, _,
 	_ActId}}, State) ->
 	case sets:is_element(Table, State#state.tables) of
 		true ->
-			error_logger:info_msg("~p: stop tracking ~p (deleted)",
-				[?MODULE, Table]),
-			Nq = case State#state.mode of
-				queue ->
-					unqueue(State#state.queue, Table);
-				store ->
-					ets:match_delete(?TABLE, {{Table,'_'}, '_', '_'}),
-					State#state.queue
-			end,
-			Ns = sets:del_element(Table, State#state.tables),
-			{noreply, State#state{queue=Nq, tables=Ns}};
+			{noreply, untrack_table(Table, State)};
 		false ->
 			{noreply, State}
 	end;
@@ -186,9 +126,11 @@ handle_info({mnesia_table_event, {write, Table, Record, [], _ActId}}, State) ->
 					State#state.queue;
 				queue ->
 					?debug("reunion(~p): queueing {~p, ~p}, expires: ~p~n",
-							[State#state.mode, Table, element(2, Record), expires()]),
-					queue:in(#qentry{table=Table, key=element(2, Record), expires=expires(),
-						op='insert', created=os:timestamp()}, State#state.queue)
+							[State#state.mode, Table, element(2, Record),
+							expires()]),
+					queue:in(#qentry{table=Table, key=element(2, Record),
+						expires=expires(), op='insert', created=os:timestamp()},
+						State#state.queue)
 			end
 	end,
 	{noreply, State#state{queue=Nq}};
@@ -203,7 +145,8 @@ handle_info({mnesia_table_event, {delete, Table, {Table, Key}, _Value, _ActId}},
 		true ->
 			case State#state.mode of
 				store ->
-					ets:insert(?TABLE, {{Table, Key}, 'delete', os:timestamp()}),
+					ets:insert(?TABLE, {{Table, Key}, 'delete',
+						os:timestamp()}),
 					State#state.queue;
 				queue ->
 					queue:in(#qentry{table=Table, key=Key, expires=expires(),
@@ -220,7 +163,8 @@ handle_info({mnesia_table_event, {delete, Table, Record, _Old, _ActId}},
 		true ->
 			case State#state.mode of
 				store ->
-					ets:insert(?TABLE, {{Table, Key}, 'delete', os:timestamp()}),
+					ets:insert(?TABLE, {{Table, Key}, 'delete',
+						os:timestamp()}),
 					State#state.queue;
 				queue ->
 					queue:in(#qentry{table=Table, key=Key, expires=expires(),
@@ -230,8 +174,10 @@ handle_info({mnesia_table_event, {delete, Table, Record, _Old, _ActId}},
 			State#state.queue
 	end,
 	{noreply, State#state{queue=Nq}};
-handle_info({mnesia_system_event, {mnesia_up, Node}}, State) when Node == node() ->
-	error_logger:info_msg("reunion: got mnesia_up for local node ~p, ignore", [node()]),
+handle_info({mnesia_system_event, {mnesia_up, Node}}, State) when
+	Node == node() ->
+	error_logger:info_msg("reunion: got mnesia_up for local node ~p, ignore",
+		[node()]),
 	{noreply, State};
 handle_info({mnesia_system_event, {mnesia_up, Node}}, State) when
 	State#state.mode == store ->
@@ -337,34 +283,13 @@ handle_info({timeout, Ref, expire}, #state{exptimer=Ref} = State) ->
 	Queue = dequeue(State#state.queue, Now),
 	{noreply, State#state{queue=Queue, exptimer=ETimer}};
 handle_info({timeout, _, {subscribe, T}}, #state{} = State) ->
-	case should_track(T) of
-		false ->
+	case {should_track(T), sets:is_element(T, State#state.tables)} of
+		{false, false} ->
 			{noreply, State};
-		true ->
-			case mnesia:wait_for_tables([T], ?WAIT_TIMEOUT) of
-				ok ->
-					case mnesia:subscribe({table, T, detailed}) of
-						{ok, _} ->
-							{noreply, State#state{tables=
-								sets:add_element(T, State#state.tables)}};
-					{error, {no_exists, T}} ->
-						error_logger:info_msg("?p: table ~p disappeared while "
-							"subscribe", [?MODULE, T]),
-						{noreply, State};
-					{error, {not_active_local, T}} ->
-						erlang:start_timer(?RESUBSCRIBE_TIMEOUT, self(),
-							{subscribe, T}),
-						{noreply, State};
-					{error, Other} ->
-						error_logger:error_msg("?p: unexpected subscribe reply "
-						"~p, cease subscribe attempts", [?MODULE, T, Other]),
-						{noreply, State}
-					end;
-				{timeout, [T]} ->
-					erlang:start_timer(?RESUBSCRIBE_TIMEOUT, self(),
-						{subscribe, T}),
-					{noreply, State}
-			end
+		{true, false} ->
+			{noreply, track_table(T, State)};
+		{true, true} ->
+			{noreply, State}
 	end;
 handle_info({mnesia_system_event,{mnesia_info, _, _}} = _E, State) ->
 	error_logger:info_msg("unhandled mnesia event ~p", [_E]),
@@ -384,10 +309,97 @@ code_change(_Old, State, _Extra) ->
 	{ok, State}.
 
 schedule_ping() ->
-	case application:get_env(?MODULE, reconnect, ?EXPIRE_TIMEOUT) of
+	Exp = ?EXPIRE_TIMEOUT,
+	case application:get_env(?MODULE, reconnect, Exp) of
 		never -> undefined;
-		Time  -> erlang:start_timer(Time*1000, ?MODULE, ping)
+		Time when is_integer(Time) -> 
+			erlang:start_timer(Time*1000, ?MODULE, ping);
+		Bad -> 
+			error_logger:info_msg("~p: bad reconnect value ~p", [?MODULE, Bad])
+			erlang:start_timer(Exp*1000, ?MODULE, ping)
 	end.
+
+track_table(Table, State) ->
+	Pre = os:timestamp(),
+	case mnesia:wait_for_tables([Table], ?WAIT_TIMEOUT) of
+		ok ->
+			Post = os:timestamp(),
+			case mnesia:subscribe({table, Table, detailed}) of
+				{ok, _} ->
+					error_logger:info_msg("~p: started tracking ~p, "
+						"elapsed:  ~p micros", [?MODULE, Table,
+						timer:now_diff(Post, Pre)]),
+					Ns = sets:add_element(Table, State#state.tables),
+					track_fragments(Table, State#state{tables=Ns});
+				{error, {not_active_local, Table}} ->
+					erlang:start_timer(?RESUBSCRIBE_TIMEOUT, self(),
+						{subscribe, Table}),
+					State;
+				{error, {no_exists, Table}} ->
+					error_logger:info_msg("~p: table ~p disappeared while "
+						"subscribe", [?MODULE, Table]),
+					State;
+				{error, Other} ->
+					error_logger:info_msg("~p: error subscribing ~p: ~p",
+						[?MODULE, Table, Other]),
+					State
+			end;
+		{timeout, [Table]} ->
+			erlang:start_timer(?RESUBSCRIBE_TIMEOUT, ?MODULE,
+				{subscribe, Table}),
+			State
+	end.
+
+track_fragments(Table, State) when is_atom(Table) ->
+	case mnesia:activity(async_dirty, fun() ->
+		mnesia:table_info(Table, frag_names) end, [], mnesia_frag) of
+		[Table] -> State;
+		[Table|Frags] ->
+			track_fragments(Frags, State)
+	end;
+track_fragments([], State) -> State;
+track_fragments([Fragment|Next], State) ->
+	case {should_track(Fragment),
+		sets:is_element(Fragment, State#state.tables)} of
+		{true, true} ->
+			track_fragments(Next, State);
+		{true, false} ->
+			track_fragments(Next, track_table(Fragment, State));
+		{false, false} ->
+			track_fragments(Next, State)
+	end.
+
+untrack_fragments(Table, State) when is_atom(Table) ->
+	case mnesia:activity(async_dirty, fun() ->
+		mnesia:table_info(Table, frag_names) end, [], mnesia_frag) of
+		[Table] -> State;
+		[Table|Frags] ->
+			untrack_fragments(Frags, State)
+	end;
+untrack_fragments([], State) -> State;
+untrack_fragments([Fragment|Next], State) ->
+	case {should_track(Fragment),
+		sets:is_element(Fragment, State#state.tables)} of
+		{false, false} ->
+			untrack_fragments(Next, State);
+		{false, true} ->
+			untrack_fragments(Next, untrack_table(Fragment, State));
+		{true, true} ->
+			untrack_fragments(Next, State)
+	end.
+
+untrack_table(Table, State) ->
+	error_logger:info_msg("~p: stop tracking ~p", [?MODULE, Table]),
+	mnesia:unsubscribe({table, Table, detailed}),
+	Nq = case State#state.mode of
+		queue ->
+			unqueue(State#state.queue, Table);
+		store ->
+			ets:match_delete(?TABLE, {{Table, '_'}, '_', '_'}),
+			State#state.queue
+	end,
+	Ns = sets:del_element(Table, State#state.tables),
+	untrack_fragments(Table, State#state{queue=Nq, tables=Ns}).
 
 should_track(T) ->
 	try mnesia:table_info(T, all) of
@@ -398,30 +410,45 @@ should_track(T) ->
 			false
 	end.
 
-should_track(_T, Attr) ->
+should_track(T, Attr) ->
 	LocalContent = proplists:get_value(local_content, Attr),
 	Type = proplists:get_value(type, Attr),
 	AllNodes = proplists:get_value(disc_copies, Attr, []) ++
 		proplists:get_value(ram_copies, Attr, []) ++
 		proplists:get_value(disc_only_copies, Attr, []),
 	Member   = lists:member(node(), AllNodes),
+	Compare  = case proplists:get_value(frag_properties, Attr, []) of
+		[] -> proplists:get_value(reunion_compare,
+				proplists:get_value(user_properties, Attr, []));
+		Frag ->
+			case proplists:get_value(base_table, Frag) of
+				T -> proplists:get_value(reunion_compare,
+						proplists:get_value(user_properties, Attr, []));
+				DiffT ->
+					get_method(DiffT, default_method())
+			end
+	end,
 	if
 		LocalContent == true ->
-			?debug("reunion: should not track ~p: local_content only~n", [_T]),
+			?debug("reunion: should not track ~p: local_content only~n", [T]),
 			false;
 		Member == false ->
 			?debug("reunion: should not track ~p: this node does not have "
-				"a copy", [_T]),
+				"a copy", [T]),
 			false;
 		Type == bag ->  % sets and ordered_sets are ok
-			?debug("reunion: should not track ~p: bag~n", [_T]),
+			?debug("reunion: should not track ~p: bag~n", [T]),
 			false;
 		length(AllNodes) == 1 ->
 			?debug("reunion: should not track ~p: all_nodes ~p~n",
-				[_T, AllNodes]),
+				[T, AllNodes]),
+			false;
+		Compare == ignore ->
+			?debug("reunion: should not track ~p: reunion_compare is ignore~n",
+				[T]),
 			false;
 		true ->
-			?debug("reunion: should track ~p~n", [_T]),
+			?debug("reunion: should track ~p~n", [T]),
 			true
 	end.
 

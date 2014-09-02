@@ -79,13 +79,23 @@ Excluding table from automatic merging:
 
 	(node@host)>mnesia:write_table_property(bag, {reunion_compare, ignore}).
 
-Disabling automatic reconnects: 
+This also disables key learning for this table, useable for tables with
+rapidly changing data.
+
+Disabling or tuning automatic reconnects: 
 -------------------------------
 	
 	(node@host)>application:set_env(reunion, reconnect, never).
 
-With this setting no new reconnect timers will be scheduled. If you want
-to 
+With this setting no new reconnect timers will be scheduled. Other possible
+setting is custom timeout value in seconds.
+
+Note on fragmented tables:
+--------------------------
+
+As `user_properties` are not auto-propagated to table fragments, 
+`compare` strategy always inherited from `base_table`. There are no 
+way to implement custom strategy for some fragment.
 
 Known problems: 
 ---------------
