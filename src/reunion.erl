@@ -315,7 +315,7 @@ schedule_ping() ->
 		Time when is_integer(Time) -> 
 			erlang:start_timer(Time*1000, ?MODULE, ping);
 		Bad -> 
-			error_logger:info_msg("~p: bad reconnect value ~p", [?MODULE, Bad])
+			error_logger:info_msg("~p: bad reconnect value ~p", [?MODULE, Bad]),
 			erlang:start_timer(Exp*1000, ?MODULE, ping)
 	end.
 
