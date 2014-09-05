@@ -560,7 +560,11 @@ do_stitch({Tab, _Nodes, {M, F, Xargs}}, Node) ->
 	try run_stitch(S0) of
 		ok -> ok
 	catch
-		throw:?DONE -> ok
+		throw:?DONE -> ok;
+		Error:Code -> 
+			error_logger:info_msg("~p: exception ~p:~p merging ~p with ~p", 
+				[?MODULE, Error, Code, Tab, Node]),
+			ok
 	end;
 do_stitch({Tab, _Nodes, ignore}, _Node) ->
 	error_logger:info_msg("~p: ignoring table ~p (configuration)",
@@ -640,7 +644,7 @@ run_stitch(#s0{module=M, function=F, table=Tab, remote=Remote, type=Type,
 				end,
 				Sx;
 			{A, B} ->
-				Sn = case M:F(A, B, Sx) of
+				Sn = try M:F(A, B, Sx) of
 					{ok, Actions, Sr} ->
 						?debug("reunion(stitch ~p ~p ~p ~p): ~p"
 							"both~n", [Tab, Type, A, B]),
@@ -650,7 +654,18 @@ run_stitch(#s0{module=M, function=F, table=Tab, remote=Remote, type=Type,
 						?debug("reunion(stitch ~p ~p ~p ~p): inconsistency "
 							"~p~n", [Tab, Type, A, B, Error]),
 						report_inconsistency(Remote, Tab, K, Error),
-						Sr
+						Sr;
+					Other -> 
+						error_logger:info_msg("~p: ~p:~p(~p, ~p, ~p): bad "
+							"return value ~p, ignoring", [?MODULE, M, F, A, 
+							B, Sx, Other]),
+						Sx
+				catch 
+					Error:Code -> 
+						error_logger:info_msg("~p: ~p:~p(~p, ~p, ~p): caught "
+							"~p:~p, ignoring", [?MODULE, M, F, A, B, Sx, Error,
+							Code]),
+						Sx
 				end,
 				Sn
 		end
@@ -675,7 +690,14 @@ do_actions({write_remote, Ae}, Remote) ->
 do_actions([{delete_remote, Ae}|Next], Remote) ->
 	delete(Remote, Ae), do_actions(Next, Remote);
 do_actions({delete_remote, Ae}, Remote) ->
-	delete(Remote, Ae).
+	delete(Remote, Ae);
+do_actions([A|Next], Remote) -> 
+	error_logger:error_msg("~p: invalid action ~p merging with ~p", 
+		[?MODULE, A, Remote]),
+	do_actions(Next, Remote);
+do_actions(A, Remote) -> 
+	error_logger:error_msg("~p: invalid action ~p merging with ~p", 
+		[?MODULE, A, Remote]).
 
 affected_tables(IslandB) ->
 	IslandA = mnesia:system_info(running_db_nodes),
@@ -706,8 +728,12 @@ delete(A) ->
 
 remote_keys(Remote, Tab) ->
 	case rpc:call(Remote, mnesia, dirty_all_keys, [Tab]) of
+		{badrpc, {'EXIT', {aborted, {no_exists, [Tab|_]}}}} -> 
+			error_logger:error_msg("~p: tab ~p does not exists on ~p",
+				[?MODULE, Tab, Remote]),
+			throw(?DONE);
 		{badrpc, Reason} ->
-			error_logger:error_msg("?p: error querying dirty_all_keys(~p) "
+			error_logger:error_msg("~p: error querying dirty_all_keys(~p) "
 				"on ~p:~n  ~p", [?MODULE, Tab, Remote, Reason]),
 			mnesia:abort({badrpc, Remote, Reason});
 		Keys -> Keys
