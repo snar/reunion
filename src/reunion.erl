@@ -554,16 +554,24 @@ stitch_tabs(TabMethods, Node) ->
 do_stitch({Tab, _Nodes, {M, F, Xargs}}, Node) ->
 	Type  = case mnesia:table_info(Tab, type) of ordered_set -> set; S -> S end,
 	Attrs = mnesia:table_info(Tab, attributes),
-	{ok, Ms} = M:F(init, {Tab, Type, Attrs, Xargs}, Node),
-	S0 = #s0{module = M, function=F, xargs=Xargs, table=Tab, type=Type,
-		attributes = Attrs, remote = Node, modstate=Ms},
-	try run_stitch(S0) of
-		ok -> ok
-	catch
-		throw:?DONE -> ok;
+	try M:F(init, {Tab, Type, Attrs, Xargs}, Node) of 
+		{ok, Ms} -> 
+			S0 = #s0{module = M, function=F, xargs=Xargs, table=Tab, type=Type,
+				attributes = Attrs, remote = Node, modstate=Ms},
+			try run_stitch(S0) of
+				ok -> ok
+			catch
+				throw:?DONE -> ok;
+				Error:Code -> 
+					error_logger:info_msg("~p: exception ~p:~p merging ~p "
+						"with ~p", [?MODULE, Error, Code, Tab, Node]),
+					ok
+			end
+	catch 
 		Error:Code -> 
-			error_logger:info_msg("~p: exception ~p:~p merging ~p with ~p", 
-				[?MODULE, Error, Code, Tab, Node]),
+			error_logger:info_msg("~p: exception ~p:~p on init state "
+				"~p:~p(init, {~p, ~p, ~p, ~p}, ~p)", 
+				[?MODULE, Error, Code, M, F, Tab, Type, Attrs, Xargs, Node]),
 			ok
 	end;
 do_stitch({Tab, _Nodes, ignore}, _Node) ->
@@ -670,7 +678,15 @@ run_stitch(#s0{module=M, function=F, table=Tab, remote=Remote, type=Type,
 				Sn
 		end
 		end, MSt, Keys),
-	M:F(done, MSt, Remote),
+	try M:F(done, MSt, Remote) of 
+		_ -> ok
+	catch 
+		Error:Code -> 
+			error_logger:info_msg("~p: caught ~p:~p finalizing "
+				"~p:~p(done, ~p, ~p), ignored",
+				[?MODULE, Error, Code, M, F, MSt, Remote]),
+			ok
+	end,
 	ok.
 
 do_actions([], _) ->
