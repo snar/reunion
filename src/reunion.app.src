@@ -6,7 +6,8 @@
   {applications, [
                   kernel,
                   stdlib,
-                  sasl
+                  sasl,
+                  mnesia
                  ]},
   {mod, { reunion_app, []}},
   {env, []}
