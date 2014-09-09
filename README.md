@@ -100,10 +100,6 @@ way to implement custom strategy for some fragment.
 Known problems: 
 ---------------
 
-As the comparison is done key-by-key, it can be slooow, especially over WAN links.
-Simple math: if you need to check 10.000 values over link with 10ms latency it 
-just can't take less than 100 seconds... 
-
 Error window: it's possible that some conflicts will not be found or that 
 reunion can introduce `missing update` problems. This is caused by the 
 fact that no table locking used, so objects in mnesia can be changed 
@@ -123,7 +119,8 @@ Other approaches:
 Major difference between our approaches: `unsplit` uses a stateless 
 approach and just unable to resolve "object present here and not present 
 there" case: this can be a result of local insertion or remote deletion, 
-and it's not possible to determine what happened without storing this information.
+and it's not possible to determine what happened without storing this 
+information.
 
 Thanks: 
 -------

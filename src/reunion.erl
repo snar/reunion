@@ -5,6 +5,7 @@
 -export([start_link/0]).
 -export([is_locally_inserted/2, is_locally_removed/2]).
 -export([check_inconsistencies/0, report_inconsistency/4]).
+-export([feed/2]).
 
 -define(TABLE, ?MODULE).
 -define(DEQUEUE_TIMEOUT, 1000).
@@ -96,7 +97,7 @@ handle_info({mnesia_table_event, {write, schema, {schema, Table, Attrs}, _,
 			?debug("reunion(write, schema): calling track_table(~p)", [Table]),
 			{noreply, track_table(Table, State)};
 		{false, true} ->
-			?debug("reunion(write, schema): calling untrack_table(~p)", 
+			?debug("reunion(write, schema): calling untrack_table(~p)",
 				[Table]),
 			{noreply, untrack_table(Table, State)};
 		{false, false} ->
@@ -312,9 +313,9 @@ schedule_ping() ->
 	Exp = ?EXPIRE_TIMEOUT,
 	case application:get_env(?MODULE, reconnect, Exp) of
 		never -> undefined;
-		Time when is_integer(Time) -> 
+		Time when is_integer(Time) ->
 			erlang:start_timer(Time*1000, ?MODULE, ping);
-		Bad -> 
+		Bad ->
 			error_logger:info_msg("~p: bad reconnect value ~p", [?MODULE, Bad]),
 			erlang:start_timer(Exp*1000, ?MODULE, ping)
 	end.
@@ -554,23 +555,51 @@ stitch_tabs(TabMethods, Node) ->
 do_stitch({Tab, _Nodes, {M, F, Xargs}}, Node) ->
 	Type  = case mnesia:table_info(Tab, type) of ordered_set -> set; S -> S end,
 	Attrs = mnesia:table_info(Tab, attributes),
-	try M:F(init, {Tab, Type, Attrs, Xargs}, Node) of 
-		{ok, Ms} -> 
+	try M:F(init, {Tab, Type, Attrs, Xargs}, Node) of
+		{ok, Ms} ->
 			S0 = #s0{module = M, function=F, xargs=Xargs, table=Tab, type=Type,
 				attributes = Attrs, remote = Node, modstate=Ms},
-			try run_stitch(S0) of
-				ok -> ok
-			catch
-				throw:?DONE -> ok;
-				Error:Code -> 
-					error_logger:info_msg("~p: exception ~p:~p merging ~p "
-						"with ~p", [?MODULE, Error, Code, Tab, Node]),
-					ok
-			end
-	catch 
-		Error:Code -> 
+			error_logger:info_msg("~p: starting table ~p with ~p",
+				[?MODULE, Tab, Node]),
+			case rpc:call(Node, ?MODULE, feed, [Tab, self()]) of
+				{ok, Ref} ->
+					try run_feed(S0, Ref) of
+						ok ->
+							error_logger:info_msg("~p: finished table ~p "
+								"(feed mode)", [?MODULE, Tab]),
+							ok
+					catch
+						throw:?DONE -> ok;
+						Error:Code ->
+							error_logger:info_msg("~p: exception ~p:~p "
+								"merging ~p with ~p (feed)",
+								[?MODULE, Error, Code, Tab, Node]),
+							ok
+					end;
+				{badrpc, _} ->
+					try run_stitch(S0) of
+						ok ->
+							error_logger:info_msg("~p: finished table ~p "
+								"(key-by-key mode)", [?MODULE, Tab]),
+							ok
+					catch
+						throw:?DONE -> ok;
+						Error:Code ->
+							error_logger:info_msg("~p: exception ~p:~p "
+								"merging ~p with ~p (key-by-key)",
+								[?MODULE, Error, Code, Tab, Node]),
+							ok
+					end
+			end;
+		Other ->
+			error_logger:error_msg("~p: unexpected answer ~p on init state "
+				"~p:~p(init, {~p, ~p, ~p, ~p}, ~p)",
+				[?MODULE, Other, M, F, Tab, Type, Attrs, Xargs, Node]),
+			ok
+	catch
+		Error:Code ->
 			error_logger:info_msg("~p: exception ~p:~p on init state "
-				"~p:~p(init, {~p, ~p, ~p, ~p}, ~p)", 
+				"~p:~p(init, {~p, ~p, ~p, ~p}, ~p)",
 				[?MODULE, Error, Code, M, F, Tab, Type, Attrs, Xargs, Node]),
 			ok
 	end;
@@ -579,6 +608,156 @@ do_stitch({Tab, _Nodes, ignore}, _Node) ->
 		[?MODULE, Tab]),
 	ok.
 
+run_feed(#s0{table=Tab} = S0, Ref) ->
+	LocalKeys = sets:from_list(mnesia:dirty_all_keys(Tab)),
+	run_feed(S0, Ref, LocalKeys).
+
+run_feed(#s0{module=M, function=F, table=Tab, remote=Remote, type=Type,
+	modstate=MSt} = S0, Ref, LocalKeys) ->
+	receive
+		{reunion_feed, Tab, Key, B, Inserted} ->
+			A = mnesia:dirty_read({Tab, Key}),
+			case {A, B} of
+				{[], []} ->
+					run_feed(S0, Ref, sets:del_element(Key, LocalKeys));
+				{A, A} ->
+					run_feed(S0, Ref, sets:del_element(Key, LocalKeys));
+				{[], [Bb]} when Type == set, Inserted == false ->
+					case is_locally_removed(Tab, Key) of
+						{true, _} ->
+							?debug("reunion(stitch ~p ~p ~p ~p): delete_remote "
+								"(locally removed)", [Tab, Key, A, B]),
+							delete(Remote, Bb),
+							run_feed(S0, Ref, sets:del_element(Key, LocalKeys));
+						false ->
+							?debug("reunion(stitch ~p ~p ~p ~p): write_local "
+								"(not locally removed)", [Tab, Key, A, B]),
+							write(Bb),
+							run_feed(S0, Ref, sets:del_element(Key, LocalKeys))
+					end;
+				{[], [Bb]} when Type == set ->
+					{true, RemoteTime} = Inserted,
+					case is_locally_removed(Tab, Key) of
+						false ->
+							?debug("reunion(stitch ~p ~p ~p ~p): write_local",
+								[Tab, Key, A, B]),
+							write(Bb);
+						{true, LocalTime} when LocalTime < RemoteTime ->
+							?debug("reunion(stitch ~p ~p ~p ~p): write_local "
+								"(remote timer won)", [Tab, Key, A, B]),
+							write(Bb);
+						{true, _} ->
+							?debug("reunion(stitch ~p ~p ~p ~p): delete_remote "
+								"(local timer won)", [Tab, Key, A, B]),
+							delete(Remote, Bb)
+					end,
+					run_feed(S0, Ref, sets:del_element(Key, LocalKeys));
+				{A, B} ->
+					try M:F(A, B, MSt) of
+						{ok, Actions, Snext} ->
+							?debug("reunion(stitch ~p ~p ~p ~p): actions ~p",
+								[Tab, Key, A, B, Actions]),
+							do_actions(Actions, Remote),
+							run_feed(S0#s0{modstate=Snext}, Ref,
+									sets:del_element(Key, LocalKeys));
+						{inconsistency, Error, Snext} ->
+							?debug("reunion(stitch ~p ~p ~p ~p): inconsistency"
+								" ~p", [Tab, Key, A, B, Error]),
+							report_inconsistency(Remote, Tab, Key, Error),
+							run_feed(S0#s0{modstate=Snext}, Ref, 
+								sets:del_element(Key, LocalKeys));
+						Other ->
+							error_logger:error_msg("~p(stitch ~p ~p ~p ~p): "
+								"unexpected result ~p, ignoring",
+								[?MODULE, Tab, Key, A, B, Other]),
+							run_feed(S0, Ref, sets:del_element(Key, LocalKeys))
+					catch
+						Error:Code ->
+							error_logger:error_msg("~p(stitch ~p ~p ~p ~p): "
+								"caught ~p:~p in ~p",
+								[?MODULE, Tab, Key, A, B, Error, Code,
+									erlang:get_stacktrace()]),
+							run_feed(S0, Ref, sets:del_element(Key, LocalKeys))
+					end
+			end;
+		{reunion_feed, Ref, eof} ->
+			end_feed(S0, LocalKeys)
+	after 30000 ->
+		error_logger:error_msg("~p: timeout waiting for key or eof from ~p",
+				[?MODULE, Remote]),
+		ok
+	end.
+			
+end_feed(#s0{module=M, function=F, table=Tab, remote=Remote, modstate=MSt,
+	type=Type}, LocalKeys) ->
+	lists:foldl(fun(K, Sx) ->
+		A = mnesia:dirty_read({Tab, K}),
+		case A of
+			[] -> Sx; % key was deleted locally too
+			[Aa] when Type == set ->
+				case is_locally_inserted(Tab, K) of
+					{true, LocalTime} ->
+						case rpc:call(Remote, ?MODULE, is_locally_removed,
+							[Tab, K]) of
+							false ->
+								?debug("reunion(stitch ~p ~p ~p []): "
+									"write_remote", [Tab, Key, A]),
+								write(Remote, Aa);
+							{true, RemoteTime} when LocalTime < RemoteTime ->
+								?debug("reunion(stitch ~p ~p ~p []): "
+									"delete_local (timer won)",
+									[Tab, Key, A]),
+								delete(Aa);
+							_ ->
+								?debug("reunion(stitch ~p ~p ~p []): "
+									"write_remote", [Tab, Key, A]),
+								write(Remote, Aa)
+						end;
+					false ->
+						?debug("reunion(stitch ~p ~p ~p, []): delete_local "
+							"(not inserted locally)",
+							[Tab, Key, A]),
+						delete(Aa)
+				end,
+				Sx;
+			A ->
+				try M:F(A, [], Sx) of
+					{ok, Actions, Snext} ->
+						?debug("reunion(stitch ~p ~p ~p, []): actions ~p",
+							[Tab, Key, A, Actions]),
+						do_actions(Actions, Remote),
+						Snext;
+					{inconsistency, Error, Snext} ->
+						?debug("reunion(stitch ~p ~p ~p ~p): inconsistency"
+							" ~p", [Tab, Key, A, B, Error]),
+						report_inconsistency(Remote, Tab, K, Error),
+						Snext;
+					Other ->
+						error_logger:error_msg("~p(stitch ~p ~p ~p []): "
+							"unexpected result ~p, ignoring",
+							[?MODULE, Tab, K, A, Other]),
+						Sx
+				catch
+					Error:Code ->
+						error_logger:error_msg("~p(stitch ~p ~p ~p []): "
+							"caught ~p:~p in ~p",
+							[?MODULE, Tab, K, A, Error, Code,
+								erlang:get_stacktrace()]),
+						Sx
+				end
+		end
+	end, MSt, sets:to_list(LocalKeys)),
+	try M:F(done, MSt, Remote) of
+		_ -> ok
+	catch
+		Error:Code ->
+			error_logger:info_msg("~p: caught ~p:~p finalizing "
+				"~p:~p(done, ~p, ~p), ignored",
+				[?MODULE, Error, Code, M, F, MSt, Remote]),
+			ok
+	end,
+	ok.
+					
 run_stitch(#s0{module=M, function=F, table=Tab, remote=Remote, type=Type,
 	modstate=MSt}) ->
 	LocalKeys = mnesia:dirty_all_keys(Tab),
@@ -663,13 +842,13 @@ run_stitch(#s0{module=M, function=F, table=Tab, remote=Remote, type=Type,
 							"~p~n", [Tab, Type, A, B, Error]),
 						report_inconsistency(Remote, Tab, K, Error),
 						Sr;
-					Other -> 
+					Other ->
 						error_logger:info_msg("~p: ~p:~p(~p, ~p, ~p): bad "
-							"return value ~p, ignoring", [?MODULE, M, F, A, 
+							"return value ~p, ignoring", [?MODULE, M, F, A,
 							B, Sx, Other]),
 						Sx
-				catch 
-					Error:Code -> 
+				catch
+					Error:Code ->
 						error_logger:info_msg("~p: ~p:~p(~p, ~p, ~p): caught "
 							"~p:~p, ignoring", [?MODULE, M, F, A, B, Sx, Error,
 							Code]),
@@ -678,10 +857,10 @@ run_stitch(#s0{module=M, function=F, table=Tab, remote=Remote, type=Type,
 				Sn
 		end
 		end, MSt, Keys),
-	try M:F(done, MSt, Remote) of 
+	try M:F(done, MSt, Remote) of
 		_ -> ok
-	catch 
-		Error:Code -> 
+	catch
+		Error:Code ->
 			error_logger:info_msg("~p: caught ~p:~p finalizing "
 				"~p:~p(done, ~p, ~p), ignored",
 				[?MODULE, Error, Code, M, F, MSt, Remote]),
@@ -707,12 +886,12 @@ do_actions([{delete_remote, Ae}|Next], Remote) ->
 	delete(Remote, Ae), do_actions(Next, Remote);
 do_actions({delete_remote, Ae}, Remote) ->
 	delete(Remote, Ae);
-do_actions([A|Next], Remote) -> 
-	error_logger:error_msg("~p: invalid action ~p merging with ~p", 
+do_actions([A|Next], Remote) ->
+	error_logger:error_msg("~p: invalid action ~p merging with ~p",
 		[?MODULE, A, Remote]),
 	do_actions(Next, Remote);
-do_actions(A, Remote) -> 
-	error_logger:error_msg("~p: invalid action ~p merging with ~p", 
+do_actions(A, Remote) ->
+	error_logger:error_msg("~p: invalid action ~p merging with ~p",
 		[?MODULE, A, Remote]).
 
 affected_tables(IslandB) ->
@@ -744,7 +923,7 @@ delete(A) ->
 
 remote_keys(Remote, Tab) ->
 	case rpc:call(Remote, mnesia, dirty_all_keys, [Tab]) of
-		{badrpc, {'EXIT', {aborted, {no_exists, [Tab|_]}}}} -> 
+		{badrpc, {'EXIT', {aborted, {no_exists, [Tab|_]}}}} ->
 			error_logger:error_msg("~p: tab ~p does not exists on ~p",
 				[?MODULE, Tab, Remote]),
 			throw(?DONE);
@@ -795,6 +974,17 @@ is_locally_removed(Tab, Key) ->
 				[Tab, Key]),
 			{true, T}
 	end.
+
+feed(Tab, Pid) ->
+	R = erlang:make_ref(),
+	spawn(fun() ->
+		lists:foreach(fun(K) ->
+			Pid ! {reunion_feed, Tab, K, mnesia:dirty_read(Tab, K),
+				is_locally_inserted(Tab, K)} end,
+		mnesia:dirty_all_keys(Tab)),
+		Pid ! {reunion_feed, R, eof}
+	end),
+	{ok, R}.
 
 check_inconsistencies() ->
 	lists:foreach(fun({{?MODULE, inconsistency, Remote, Tab, Key}, _}) ->
