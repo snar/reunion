@@ -175,9 +175,8 @@ handle_info({mnesia_table_event, {delete, Table, Record, _Old, _ActId}},
 	end,
 	{noreply, State#state{queue=Nq}};
 handle_info({mnesia_system_event, {mnesia_up, Node}}, State) when
-	Node == node() ->
-	error_logger:info_msg("reunion: got mnesia_up for local node ~p, ignore",
-		[node()]),
+	Node == node(); State#state.mode == queue ->
+	% this is about new or local node
 	{noreply, State};
 handle_info({mnesia_system_event, {mnesia_up, Node}}, State) when
 	State#state.mode == store ->
