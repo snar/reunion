@@ -1,7 +1,7 @@
 {application, reunion,
  [
   {description, "Mnesia converge-after-partition helper"},
-  {vsn, "0.1"},
+  {vsn, "0.2"},
   {registered, [reunion]},
   {applications, [
                   kernel,
