@@ -898,8 +898,10 @@ affected_tables(IslandB) ->
 	Tables = mnesia:system_info(tables) -- [schema],
 	lists:foldl(fun(T, Acc) ->
 		Nodes = mnesia:table_info(T, all_nodes),
+		Attrs = mnesia:table_info(T, all),
+		Should = should_track(T, Attrs),
 		case {intersection(IslandA, Nodes), intersection(IslandB, Nodes)} of
-			{[_|_], [_|_]} ->
+			{[_|_], [_|_]} when Should == true ->
 				[{T, Nodes}|Acc];
 			_ -> Acc
 		end end, [], Tables).
